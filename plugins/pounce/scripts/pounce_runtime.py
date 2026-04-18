@@ -2897,3 +2897,436 @@ def ensure_workspace_config_toml(config_path: Path) -> None:
         content = re.sub(r"(?m)^\[features\]\s*$", "[features]\ncodex_hooks = true", content, count=1)
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(content.rstrip() + "\n", encoding="utf-8")
+
+
+def isoformat_utc(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def is_within_path(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def workspace_has_dashboard_signals(workspace: Path) -> bool:
+    if not workspace.exists() or not workspace.is_dir():
+        return False
+    for name in (".git", "AGENTS.md", ".codex", ".pounce"):
+        if (workspace / name).exists():
+            return True
+    return bool(iter_dependency_guard_files(workspace))
+
+
+def resolve_dashboard_workspace(
+    workspace_value: str | None,
+    plugin_root: Path,
+    *,
+    current_workspace: Path | None = None,
+) -> tuple[Path | None, bool]:
+    requested = str(workspace_value or "").strip()
+    if requested:
+        candidate = Path(requested).expanduser().resolve()
+        return candidate, candidate.exists() and candidate.is_dir()
+
+    candidate = (current_workspace or Path.cwd()).expanduser().resolve()
+    if not candidate.exists() or not candidate.is_dir():
+        return None, False
+    if is_within_path(candidate, plugin_root):
+        return None, False
+    if not workspace_has_dashboard_signals(candidate):
+        return None, False
+    return candidate, True
+
+
+def workspace_managed_policy_present(workspace: Path) -> bool:
+    agents_path = workspace / "AGENTS.md"
+    if not agents_path.exists():
+        return False
+    content = agents_path.read_text(encoding="utf-8")
+    return MANAGED_BLOCK_BEGIN in content and MANAGED_BLOCK_END in content
+
+
+def workspace_hook_configuration(workspace: Path) -> dict[str, bool]:
+    payload = load_json_file(workspace / ".codex" / "hooks.json", default={})
+    hooks = payload.get("hooks") if isinstance(payload, dict) else {}
+    if not isinstance(hooks, dict):
+        hooks = {}
+
+    def event_has_pounce_hook(event_name: str, *, matcher: str | None = None) -> bool:
+        entries = hooks.get(event_name)
+        if not isinstance(entries, list):
+            return False
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            if matcher is not None and entry.get("matcher") != matcher:
+                continue
+            hook_items = entry.get("hooks")
+            if not isinstance(hook_items, list):
+                continue
+            if any(is_pounce_hook(hook) for hook in hook_items):
+                return True
+        return False
+
+    pre_tool_use_bash = event_has_pounce_hook("PreToolUse", matcher="Bash")
+    user_prompt_submit = event_has_pounce_hook("UserPromptSubmit")
+    stop = event_has_pounce_hook("Stop")
+    return {
+        "pre_tool_use_bash": pre_tool_use_bash,
+        "user_prompt_submit": user_prompt_submit,
+        "stop": stop,
+        "all_events": pre_tool_use_bash and user_prompt_submit and stop,
+    }
+
+
+def workspace_hooks_enabled(workspace: Path) -> bool:
+    config_path = workspace / ".codex" / "config.toml"
+    if not config_path.exists():
+        return False
+
+    content = config_path.read_text(encoding="utf-8")
+    try:
+        payload = tomllib.loads(content)
+    except tomllib.TOMLDecodeError:
+        return bool(re.search(r"(?m)^codex_hooks\s*=\s*true\s*$", content))
+
+    features = payload.get("features")
+    if not isinstance(features, dict):
+        return False
+    return bool(features.get("codex_hooks"))
+
+
+def dashboard_guard_entries(workspace: Path) -> list[dict[str, Any]]:
+    guard_dir = workspace / ".pounce" / GUARD_STATE_DIRNAME
+    if not guard_dir.exists():
+        return []
+
+    entries: list[dict[str, Any]] = []
+    for path in guard_dir.glob("turn-*.json"):
+        payload = load_json_file(path, default=None)
+        if not isinstance(payload, dict):
+            continue
+        mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+        captured_at = str(payload.get("captured_at", "")).strip() or isoformat_utc(mtime)
+        allowlist = payload.get("allowlist")
+        entries.append(
+            {
+                "captured_at": captured_at,
+                "turn_id": str(payload.get("turn_id", "")).strip() or None,
+                "allowlist_count": len(allowlist) if isinstance(allowlist, list) else 0,
+                "state_path": str(path),
+                "_sort_key": parse_timestamp(captured_at) or mtime,
+            }
+        )
+
+    entries.sort(key=lambda item: item["_sort_key"], reverse=True)
+    for entry in entries:
+        entry.pop("_sort_key", None)
+    return entries
+
+
+def dashboard_subject_from_request(mode: str, request: dict[str, Any]) -> str:
+    package_name = str(request.get("package_name", "")).strip()
+    version = str(request.get("version", "")).strip()
+    if package_name and version:
+        return f"{package_name}@{version}"
+
+    for key in ("artifacts", "ioc_query"):
+        value = request.get(key)
+        if isinstance(value, str) and value.strip():
+            return truncate(value.strip(), 80)
+        if isinstance(value, list):
+            for item in value:
+                text = str(item).strip()
+                if text:
+                    return truncate(text, 80)
+
+    if mode == "sweep":
+        return "workspace sweep"
+    return "requested artifact"
+
+
+def dashboard_stamp_entries(workspace: Path) -> list[dict[str, Any]]:
+    stamp_dir = workspace / ".pounce" / "stamps"
+    if not stamp_dir.exists():
+        return []
+
+    entries: list[dict[str, Any]] = []
+    for path in stamp_dir.glob("*.json"):
+        payload = load_json_file(path, default=None)
+        if not isinstance(payload, dict):
+            continue
+        mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+        checked_at = str(payload.get("checked_at", "")).strip() or isoformat_utc(mtime)
+        mode = str(payload.get("mode", "")).strip() or "release"
+        request = payload.get("request")
+        if not isinstance(request, dict):
+            request = {}
+        entries.append(
+            {
+                "checked_at": checked_at,
+                "mode": mode,
+                "verdict": str(payload.get("verdict", "")).strip() or "unknown",
+                "subject": dashboard_subject_from_request(mode, request),
+                "summary": str(payload.get("summary", "")).strip() or "No summary available.",
+                "stamp_path": str(path),
+                "_sort_key": parse_timestamp(checked_at) or mtime,
+            }
+        )
+
+    entries.sort(key=lambda item: item["_sort_key"], reverse=True)
+    for entry in entries:
+        entry.pop("_sort_key", None)
+    return entries
+
+
+def compact_feed_sources(sources: Any) -> list[dict[str, Any]]:
+    compact: list[dict[str, Any]] = []
+    if not isinstance(sources, list):
+        return compact
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        entry = {
+            "name": str(source.get("name", "")).strip() or "unknown",
+            "status": str(source.get("status", "")).strip() or None,
+            "item_count": source.get("item_count"),
+            "last_modified": str(source.get("last_modified", "")).strip() or None,
+            "synced_at": str(source.get("synced_at", "")).strip() or None,
+        }
+        compact.append(entry)
+    return compact
+
+
+def build_workspace_dashboard(workspace: Path | None, *, available: bool) -> dict[str, Any]:
+    if workspace is None:
+        return {
+            "available": False,
+            "path": None,
+            "protection_status": "unavailable",
+            "managed_policy": False,
+            "hooks_configured": {
+                "pre_tool_use_bash": False,
+                "user_prompt_submit": False,
+                "stop": False,
+                "all_events": False,
+            },
+            "hooks_enabled": False,
+            "dependency_file_count": 0,
+            "latest_guard_snapshot": None,
+            "last_sweep": None,
+        }
+
+    hook_status = workspace_hook_configuration(workspace) if available else {
+        "pre_tool_use_bash": False,
+        "user_prompt_submit": False,
+        "stop": False,
+        "all_events": False,
+    }
+    managed_policy = workspace_managed_policy_present(workspace) if available else False
+    hooks_enabled = workspace_hooks_enabled(workspace) if available else False
+    latest_guard_snapshot = next(iter(dashboard_guard_entries(workspace)), None) if available else None
+    stamp_entries = dashboard_stamp_entries(workspace) if available else []
+    last_sweep = next((entry for entry in stamp_entries if entry["mode"] == "sweep"), None)
+
+    if not available:
+        protection_status = "unavailable"
+    elif managed_policy and hook_status["all_events"] and hooks_enabled:
+        protection_status = "protected"
+    else:
+        protection_status = "partial"
+
+    return {
+        "available": available,
+        "path": str(workspace),
+        "protection_status": protection_status,
+        "managed_policy": managed_policy,
+        "hooks_configured": hook_status,
+        "hooks_enabled": hooks_enabled,
+        "dependency_file_count": len(iter_dependency_guard_files(workspace)) if available else 0,
+        "latest_guard_snapshot": latest_guard_snapshot,
+        "last_sweep": last_sweep,
+    }
+
+
+def build_feed_dashboard(plugin_root: Path) -> dict[str, Any]:
+    context = pounce_intel.runtime_feed(plugin_root, os.getenv("POUNCE_IOC_FEED_URL"))
+    feed = context.get("feed")
+    if not isinstance(feed, dict):
+        feed = {}
+    items = feed.get("items")
+    if not isinstance(items, list):
+        items = []
+    warnings = context.get("warnings")
+    if not isinstance(warnings, list):
+        warnings = []
+
+    return {
+        "selected_from": str(context.get("selected_from", "")).strip() or "seed",
+        "cache_timestamp": str(context.get("cache_timestamp", "")).strip() or None,
+        "active_item_count": len(pounce_intel.active_feed_items(items)),
+        "warnings": [
+            {
+                "code": str(item.get("code", "")).strip() or "warning",
+                "detail": str(item.get("detail", "")).strip() or "Unknown warning.",
+                "selected_from": str(item.get("selected_from", "")).strip() or None,
+            }
+            for item in warnings
+            if isinstance(item, dict)
+        ],
+        "sources": compact_feed_sources(feed.get("sources")),
+    }
+
+
+def build_dashboard_snapshot(
+    payload: dict[str, Any] | None,
+    plugin_root: Path,
+    *,
+    current_workspace: Path | None = None,
+) -> dict[str, Any]:
+    request = payload if isinstance(payload, dict) else {}
+    workspace_value = str(request.get("workspace", "")).strip()
+    resolved_workspace, available = resolve_dashboard_workspace(
+        workspace_value,
+        plugin_root,
+        current_workspace=current_workspace,
+    )
+    workspace_snapshot = build_workspace_dashboard(resolved_workspace, available=available)
+    recent_verdicts = (
+        dashboard_stamp_entries(resolved_workspace)[:5]
+        if resolved_workspace is not None and available
+        else []
+    )
+
+    return {
+        "generated_at": iso_now(),
+        "workspace": workspace_snapshot,
+        "feed": build_feed_dashboard(plugin_root),
+        "recent_verdicts": recent_verdicts,
+    }
+
+
+def render_dashboard_markdown(snapshot: dict[str, Any]) -> str:
+    workspace = snapshot.get("workspace")
+    if not isinstance(workspace, dict):
+        workspace = {}
+    feed = snapshot.get("feed")
+    if not isinstance(feed, dict):
+        feed = {}
+    recent_verdicts = snapshot.get("recent_verdicts")
+    if not isinstance(recent_verdicts, list):
+        recent_verdicts = []
+
+    lines = ["## Pounce Dashboard", ""]
+
+    lines.append("### Workspace")
+    if not workspace.get("available"):
+        raw_path = workspace.get("path")
+        path = str(raw_path).strip() if raw_path is not None else ""
+        if path:
+            lines.append(f"- Workspace status: unavailable at `{path}`.")
+        else:
+            lines.append("- Workspace status: unavailable. No workspace was resolved for this dashboard.")
+    else:
+        hooks = workspace.get("hooks_configured")
+        if not isinstance(hooks, dict):
+            hooks = {}
+        configured_count = sum(
+            1
+            for key in ("pre_tool_use_bash", "user_prompt_submit", "stop")
+            if hooks.get(key)
+        )
+        lines.append(f"- Protection status: `{workspace.get('protection_status', 'partial')}`")
+        lines.append(f"- Path: `{workspace.get('path')}`")
+        lines.append(
+            f"- Managed policy: {'present' if workspace.get('managed_policy') else 'missing'}"
+        )
+        lines.append(
+            f"- Hooks: {configured_count}/3 configured; "
+            f"{'enabled' if workspace.get('hooks_enabled') else 'disabled'} in `.codex/config.toml`"
+        )
+        lines.append(f"- Dependency files tracked: {workspace.get('dependency_file_count', 0)}")
+
+        latest_guard = workspace.get("latest_guard_snapshot")
+        if isinstance(latest_guard, dict):
+            lines.append(
+                "- Latest guard snapshot: "
+                f"`{latest_guard.get('captured_at', 'unknown')}`"
+                f", turn `{latest_guard.get('turn_id', 'unknown')}`"
+                f", allowlist {latest_guard.get('allowlist_count', 0)}"
+            )
+        else:
+            lines.append("- Latest guard snapshot: none")
+
+        last_sweep = workspace.get("last_sweep")
+        if isinstance(last_sweep, dict):
+            lines.append(
+                "- Last sweep: "
+                f"`{last_sweep.get('checked_at', 'unknown')}`"
+                f", `{str(last_sweep.get('verdict', 'unknown')).upper()}`"
+            )
+        else:
+            lines.append("- Last sweep: none")
+
+    lines.append("")
+    lines.append("### Feed")
+    selected_from = str(feed.get("selected_from", "seed")).strip() or "seed"
+    raw_cache_timestamp = feed.get("cache_timestamp")
+    cache_timestamp = str(raw_cache_timestamp).strip() if raw_cache_timestamp is not None else ""
+    lines.append(f"- Selected source: `{selected_from}`")
+    if cache_timestamp:
+        lines.append(f"- Freshness timestamp: `{cache_timestamp}`")
+    else:
+        lines.append("- Freshness timestamp: no synced or hosted feed cache was available.")
+    lines.append(f"- Active items: {feed.get('active_item_count', 0)}")
+
+    sources = feed.get("sources")
+    if isinstance(sources, list) and sources:
+        source_summaries: list[str] = []
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            details = [str(source.get("name", "unknown")).strip() or "unknown"]
+            status = str(source.get("status", "")).strip()
+            if status:
+                details.append(status)
+            item_count = source.get("item_count")
+            if item_count not in {None, ""}:
+                details.append(f"items={item_count}")
+            last_modified = str(source.get("last_modified", "")).strip()
+            if last_modified:
+                details.append(f"modified={last_modified}")
+            synced_at = str(source.get("synced_at", "")).strip()
+            if synced_at:
+                details.append(f"synced={synced_at}")
+            source_summaries.append(", ".join(details))
+        lines.append(f"- Sources: {'; '.join(source_summaries) if source_summaries else 'none'}")
+    else:
+        lines.append("- Sources: none")
+
+    warnings = feed.get("warnings")
+    if isinstance(warnings, list) and warnings:
+        for warning in warnings:
+            if not isinstance(warning, dict):
+                continue
+            detail = str(warning.get("detail", "")).strip() or "Unknown warning."
+            lines.append(f"- Warning: {detail}")
+    else:
+        lines.append("- Warnings: none")
+
+    lines.append("")
+    lines.append("### Recent Verdicts")
+    if recent_verdicts:
+        for verdict in recent_verdicts:
+            if not isinstance(verdict, dict):
+                continue
+            checked_at = str(verdict.get("checked_at", "")).strip() or "unknown"
+            status = str(verdict.get("verdict", "unknown")).upper()
+            subject = str(verdict.get("subject", "requested artifact")).strip() or "requested artifact"
+            summary = str(verdict.get("summary", "")).strip() or "No summary available."
+            lines.append(f"- `{checked_at}` `{status}` `{subject}`: {summary}")
+    else:
+        lines.append("- No recent verdicts were found for this workspace.")
+
+    return "\n".join(lines)

@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from pounce_runtime import plugin_root_from_script, vet_payload
+from pounce_runtime import build_dashboard_snapshot, plugin_root_from_script, render_dashboard_markdown, vet_payload
 
 
 SERVER_NAME = "pounce"
@@ -31,7 +31,7 @@ def send_message(payload: dict[str, Any]) -> None:
     sys.stdout.buffer.flush()
 
 
-def tool_schema() -> dict[str, Any]:
+def vet_tool_schema() -> dict[str, Any]:
     return {
         "name": "pounce.vet",
         "description": "Vet dependency releases, suspicious artifact strings, or a workspace sweep for supply-chain risk signals.",
@@ -70,6 +70,23 @@ def tool_schema() -> dict[str, Any]:
     }
 
 
+def dashboard_tool_schema() -> dict[str, Any]:
+    return {
+        "name": "pounce.dashboard",
+        "description": "Show a structured Pounce dashboard snapshot for the current workspace, feed status, and recent verdicts.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace": {
+                    "type": "string",
+                    "description": "Optional workspace root to inspect. When omitted, Pounce will use a best-effort current-workspace fallback.",
+                }
+            },
+            "additionalProperties": False,
+        },
+    }
+
+
 def handle_request(message: dict[str, Any], plugin_root: Path) -> None:
     method = message.get("method")
     message_id = message.get("id")
@@ -97,13 +114,19 @@ def handle_request(message: dict[str, Any], plugin_root: Path) -> None:
         return
 
     if method == "tools/list":
-        send_message({"jsonrpc": "2.0", "id": message_id, "result": {"tools": [tool_schema()]}})
+        send_message(
+            {
+                "jsonrpc": "2.0",
+                "id": message_id,
+                "result": {"tools": [vet_tool_schema(), dashboard_tool_schema()]},
+            }
+        )
         return
 
     if method == "tools/call":
         name = params.get("name")
         arguments = params.get("arguments", {})
-        if name != "pounce.vet":
+        if name not in {"pounce.vet", "pounce.dashboard"}:
             send_message(
                 {
                     "jsonrpc": "2.0",
@@ -116,13 +139,18 @@ def handle_request(message: dict[str, Any], plugin_root: Path) -> None:
             )
             return
         try:
-            result = vet_payload(arguments, plugin_root)
+            if name == "pounce.dashboard":
+                result = build_dashboard_snapshot(arguments, plugin_root, current_workspace=Path.cwd())
+                content_text = render_dashboard_markdown(result)
+            else:
+                result = vet_payload(arguments, plugin_root)
+                content_text = json.dumps(result, indent=2)
             send_message(
                 {
                     "jsonrpc": "2.0",
                     "id": message_id,
                     "result": {
-                        "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
+                        "content": [{"type": "text", "text": content_text}],
                         "structuredContent": result,
                     },
                 }

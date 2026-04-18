@@ -34,6 +34,7 @@
     "websiteURL": "https://github.com/therajsharma/Project-Zero",
     "defaultPrompt": [
       "Vet plain-crypto-js@4.2.1 before adding it to this project",
+      "Show the Pounce dashboard for this workspace",
       "Sweep this repo for malicious package IOCs and install-time execution paths",
       "Block risky Bash dependency installs and recommend an exact safer rewrite"
     ],
