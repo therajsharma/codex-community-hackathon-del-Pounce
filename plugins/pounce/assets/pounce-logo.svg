@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 96" role="img" aria-label="Pounce logo">
+  <rect width="320" height="96" rx="8" fill="#111827"/>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M24 64 44 24l14 20 20-20" stroke="#F97316" stroke-width="10"/>
+    <circle cx="84" cy="24" r="10" fill="#FDBA74" stroke="none"/>
+  </g>
+  <text x="112" y="61" fill="#F9FAFB" font-family="Arial, sans-serif" font-size="36" font-weight="700">Pounce</text>
+</svg>

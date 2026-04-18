@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "pounce": {
+      "command": "python3",
+      "args": [
+        "./scripts/pounce_mcp_server.py"
+      ]
+    }
+  }
+}

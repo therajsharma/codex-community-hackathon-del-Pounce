@@ -1,0 +1,44 @@
+{
+  "name": "pounce",
+  "version": "0.1.0",
+  "description": "Codex-native dependency vetting and supply-chain guardrails for AI-assisted coding.",
+  "author": {
+    "name": "Local Security Plugin",
+    "email": "support@example.invalid",
+    "url": "/Users/sysuser/Documents/codebase/security/proj-zero"
+  },
+  "homepage": "/Users/sysuser/Documents/codebase/security/proj-zero/docs/tripwire-final-spec.md",
+  "repository": "/Users/sysuser/Documents/codebase/security/proj-zero",
+  "license": "MIT",
+  "keywords": [
+    "security",
+    "supply-chain",
+    "dependencies",
+    "codex",
+    "mcp"
+  ],
+  "skills": "./skills/",
+  "hooks": "./hooks.json",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Pounce",
+    "shortDescription": "Vet dependency releases before Codex writes or installs them",
+    "longDescription": "Pounce is a local Codex plugin for dependency vetting, onboarding sweeps, and shell-time install guardrails aimed at supply-chain incidents and risky fresh releases.",
+    "developerName": "Local Security Plugin",
+    "category": "Coding",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Vet axios@1.14.1 before adding it to this project",
+      "Sweep this repo for IOC exposure from recent package compromises",
+      "Recommend the safest exact package version for this dependency"
+    ],
+    "brandColor": "#C2410C",
+    "composerIcon": "./assets/pounce-icon.svg",
+    "logo": "./assets/pounce-logo.svg",
+    "screenshots": []
+  }
+}

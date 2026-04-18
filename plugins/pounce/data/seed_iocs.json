@@ -1,0 +1,64 @@
+{
+  "items": [
+    {
+      "id": "ioc-2026-031",
+      "severity": "critical",
+      "reason": "Known malicious dependency from the Axios supply-chain compromise disclosed on March 31, 2026.",
+      "match": {
+        "type": "package",
+        "ecosystem": "npm",
+        "name": "plain-crypto-js",
+        "version": "4.2.1"
+      }
+    },
+    {
+      "id": "ioc-2026-032",
+      "severity": "critical",
+      "reason": "Known network IOC from the Axios supply-chain compromise disclosed on March 31, 2026.",
+      "match": {
+        "type": "string",
+        "value": "sfrclak.com"
+      }
+    },
+    {
+      "id": "ioc-2026-033",
+      "severity": "critical",
+      "reason": "Known compromised LiteLLM release from the March 2026 PyPI incident.",
+      "match": {
+        "type": "package",
+        "ecosystem": "pypi",
+        "name": "litellm",
+        "version": "1.82.7"
+      }
+    },
+    {
+      "id": "ioc-2026-034",
+      "severity": "critical",
+      "reason": "Known compromised LiteLLM release from the March 2026 PyPI incident.",
+      "match": {
+        "type": "package",
+        "ecosystem": "pypi",
+        "name": "litellm",
+        "version": "1.82.8"
+      }
+    },
+    {
+      "id": "ioc-2026-035",
+      "severity": "critical",
+      "reason": "Known LiteLLM persistence artifact from the March 2026 PyPI incident.",
+      "match": {
+        "type": "string",
+        "value": "litellm_init.pth"
+      }
+    },
+    {
+      "id": "ioc-2026-036",
+      "severity": "critical",
+      "reason": "Known malicious Python bootstrap behavior from the March 2026 LiteLLM incident when seen in install-time code.",
+      "match": {
+        "type": "string",
+        "value": "subprocess.Popen"
+      }
+    }
+  ]
+}
