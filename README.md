@@ -6,7 +6,7 @@
 
 Pounce is a Codex-native dependency security layer that vets exact package releases, enforces shell-time install guardrails, blocks unexplained manifest edits, and surfaces trust state directly in chat.
 
-![Pounce plugin overview](docs/git_main.png)
+![Pounce plugin overview](docs/git_main_plugin.png)
 
 ## Quick start
 
@@ -55,3 +55,4 @@ Show the Pounce dashboard for this workspace
 - [Plugin README](plugins/pounce/README.md)
 - [Getting started guide](docs/getting-started.md)
 - [Final spec](docs/pounce-final-spec.md)
+- [Pitch deck](docs/Pounc_Pitch.pdf)
