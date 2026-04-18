@@ -79,6 +79,37 @@ class PounceMcpServerTests(unittest.TestCase):
         self.assertIn("pounce.vet", tool_names)
         self.assertIn("pounce.dashboard", tool_names)
 
+    def test_vet_tool_schema_advertises_release_and_sweep_requirements(self) -> None:
+        responses = self._run_server(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": "2025-03-26"},
+            },
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+        )
+
+        tools_list = next(item for item in responses if item["id"] == 2)
+        vet_tool = next(tool for tool in tools_list["result"]["tools"] if tool["name"] == "pounce.vet")
+        schema = vet_tool["inputSchema"]
+        self.assertEqual(
+            schema["dependentRequired"],
+            {
+                "ecosystem": ["package_name", "version"],
+                "package_name": ["ecosystem", "version"],
+                "version": ["ecosystem", "package_name"],
+            },
+        )
+        release_branch = next(
+            branch for branch in schema["oneOf"] if branch.get("properties", {}).get("mode", {}).get("const") == "release"
+        )
+        sweep_branch = next(
+            branch for branch in schema["oneOf"] if branch.get("properties", {}).get("mode", {}).get("const") == "sweep"
+        )
+        self.assertEqual(release_branch["properties"]["mode"]["const"], "release")
+        self.assertEqual(sweep_branch["required"], ["mode", "workspace"])
+
     def test_vet_call_returns_structured_content(self) -> None:
         responses = self._run_server(
             {

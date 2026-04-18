@@ -4,12 +4,12 @@ Pounce is a local Codex plugin for dependency vetting, onboarding sweeps, shell-
 
 The Codex-native visibility surface is `pounce.dashboard`: ask the agent to show the Pounce dashboard and it will render a structured markdown snapshot of workspace protection, feed status, and recent verdicts directly in chat.
 
-## Why it is demo-ready
+## Why it is ready to try
 
 Pounce is built for the exact place where AI coding agents create supply-chain risk: dependency changes. The current project already supports:
 
 - exact release vetting for npm and PyPI
-- shell-time interception for `npm`, `pnpm`, `yarn`, `bun`, `pip`, `pip3`, `uv`, and `poetry`
+- shell-time interception for `npm`, `pnpm`, `yarn`, `bun`, `pip`, `pip3`, `pipx`, `uv`, `uvx`, and `poetry`
 - exact-version rewrite guidance for non-exact install commands
 - same-turn dependency guardrails for manifest and lockfile edits
 - workspace sweeps for malicious package indicators
@@ -18,7 +18,7 @@ Pounce is built for the exact place where AI coding agents create supply-chain r
 - managed workspace hooks and policy injection
 - refreshable threat-intelligence feeds with bundled fallback data
 
-For a hackathon presentation, the fastest path is:
+For a quick local evaluation, the fastest path is:
 
 ```bash
 python3 plugins/pounce/scripts/install_local.py --workspace "$(pwd)"
@@ -32,10 +32,10 @@ Then in Codex, ask:
 Show the Pounce dashboard for this workspace
 ```
 
-Presentation docs:
+Reference docs:
 
 - [`docs/pounce-final-spec.md`](../../docs/pounce-final-spec.md)
-- [`docs/hackathon-demo.md`](../../docs/hackathon-demo.md)
+- [`docs/getting-started.md`](../../docs/getting-started.md)
 
 ## Local install
 
@@ -84,10 +84,10 @@ The dashboard also reports:
 The installed workspace hooks enforce a three-stage flow:
 
 1. `UserPromptSubmit` snapshots dependency manifests and lockfiles for the current turn.
-2. `PreToolUse` inspects Bash dependency commands, blocks known-bad releases, and blocks non-exact specs until the command is rewritten to an exact version.
+2. `PreToolUse` inspects Bash dependency commands, blocks known-bad releases, blocks non-exact specs until the command is rewritten to an exact version, and fails closed on non-registry sources or piped execution paths.
 3. `Stop` compares the current dependency files against the turn snapshot and blocks unexplained edits that were not recorded as expected mutations from a vetted install.
 
-When verification is degraded, `pounce.vet` stays available but returns `verification_status = "degraded"` and `manual_review_required = true`. Hook-enforced installs fail closed in that state.
+When verification is degraded, `pounce.vet` stays available but returns `verification_status = "degraded"` and `manual_review_required = true`. Hook-enforced installs fail closed in that state, including rate-limit responses that request backoff beyond the bounded retry window.
 
 When Pounce can recommend a vetted exact rewrite, it returns a concrete command such as:
 
@@ -96,7 +96,7 @@ npm i demo@1.2.0 --save-exact
 pip3 install demo==1.5.0
 ```
 
-Same-turn allowlisting is automatic only after the install command itself passes Pounce checks.
+Same-turn allowlisting is automatic only after a vetted mutating install command passes Pounce checks. Runner-style commands such as `pipx run`, `uvx`, and `pnpm dlx` are vetted but do not create allowlist mutations.
 
 ## Dependency files and scans
 

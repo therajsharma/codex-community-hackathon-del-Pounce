@@ -59,12 +59,14 @@ The current implementation uses three workspace hook events plus two MCP tools:
 Supported shell command families today:
 
 - `npm install`, `npm i`, `npm add`
-- `pnpm add`, `pnpm up`
+- `pnpm add`, `pnpm up`, `pnpm dlx`
 - `yarn add`, `yarn up`
 - `bun add`
-- `pip install`, `pip3 install`
-- `uv pip install`, `uv add`
+- `pip install`, `pip3 install`, `pipx run`
+- `uv pip install`, `uv add`, `uvx`
 - `poetry add`
+
+Hook enforcement also fails closed for dependency commands hidden behind `sh`/`bash`/`zsh` `-c` wrappers, non-registry tarball/git/url/file sources, and piped execution paths.
 
 Supported dependency files in the guard path:
 
@@ -90,13 +92,13 @@ Dashboard feed source selection values:
 - `local_sync_cache`
 - `seed`
 
-## Why it is a strong hackathon project
+## Why it is a strong product fit
 
-Pounce fits the Codex hackathon because it is both a developer tool and an agent workflow improvement:
+Pounce works well as both a developer tool and an agent workflow improvement:
 
-- it is squarely in `Agentic Coding`
-- it has a clear `Building Evals` angle because it scores and blocks dependency changes
-- it is easy to demo live because the full loop happens inside Codex workflows
+- it sits directly in the agent workflow where dependency risk is created
+- it provides a concrete evaluation surface because dependency changes can be scored and blocked
+- it is easy to explain because the full loop happens inside Codex workflows
 
 ## Demo narrative
 
@@ -108,15 +110,15 @@ Pounce fits the Codex hackathon because it is both a developer tool and an agent
 6. Show `pounce.dashboard` in chat.
 7. Finish with the smoke script and test suite to prove the current feature set still works.
 
-## Demo-ready status
+## Current readiness
 
-For the hackathon presentation, the focus is demo reliability over broad product surface area:
+The current implementation prioritizes reliable end-to-end behavior over broad product surface area:
 
 - the metadata now points at a public repository instead of machine-local paths
 - the README includes a fast demo path
 - the repository includes a deterministic smoke script for the current feature set
 - the smoke script exercises release vetting, sweep mode, hook enforcement, same-turn guardrails, installer wiring, and MCP tool exposure
 
-## Next product step after the hackathon
+## Next product step
 
 The next major step is a stronger trust model for hosted feeds, including signed feed verification and more explicit source health reporting.

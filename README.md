@@ -1,5 +1,9 @@
 # Pounce
 
+[![Tests](https://github.com/therajsharma/Project-Zero/actions/workflows/test.yml/badge.svg)](https://github.com/therajsharma/Project-Zero/actions/workflows/test.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Python 3.13](https://img.shields.io/badge/python-3.13-blue.svg)](https://www.python.org/downloads/)
+
 Pounce is a Codex-native dependency security layer that vets exact package releases, enforces shell-time install guardrails, blocks unexplained manifest edits, and surfaces trust state directly in chat.
 
 ![Pounce dashboard preview](plugins/pounce/assets/pounce-dashboard.png)
@@ -30,7 +34,7 @@ Show the Pounce dashboard for this workspace
 
 - Hosted feeds are HTTPS-only, redirects are disabled, and responses are capped at 5 MiB.
 - `pounce.vet` stays usable when verification is degraded, but now returns `verification_status` and `manual_review_required`.
-- Hook-enforced dependency installs fail closed when verification is unavailable or the guard state is missing or corrupt.
+- Hook-enforced dependency installs fail closed when verification is unavailable, throttled past the bounded retry window, or the guard state is missing or corrupt.
 - Package names are validated before subprocess or registry use, and the `npm view` path uses an explicit `--` separator.
 - Workspace writes are confined so stamps, guard state, and installer output cannot target `/`, `$HOME`, plugin internals, or shared state directories.
 
@@ -49,5 +53,5 @@ Show the Pounce dashboard for this workspace
 ## Docs
 
 - [Plugin README](plugins/pounce/README.md)
-- [Hackathon demo runbook](docs/hackathon-demo.md)
+- [Getting started guide](docs/getting-started.md)
 - [Final spec](docs/pounce-final-spec.md)

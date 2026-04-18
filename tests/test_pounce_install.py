@@ -118,6 +118,78 @@ class PounceInstallTests(unittest.TestCase):
         self.assertEqual(agents_text.count("BEGIN POUNCE MANAGED BLOCK"), 1)
         self.assertEqual(sum(plugin["name"] == "pounce" for plugin in marketplace["plugins"]), 1)
 
+    def test_main_rolls_back_existing_files_on_keyboard_interrupt(self) -> None:
+        with tempfile.TemporaryDirectory() as home_dir, tempfile.TemporaryDirectory() as workspace_dir:
+            fake_home = Path(home_dir)
+            workspace = Path(workspace_dir)
+            installed_root = fake_home / ".codex" / "plugins" / "pounce"
+            marketplace_path = fake_home / ".agents" / "plugins" / "marketplace.json"
+            hooks_path = workspace / ".codex" / "hooks.json"
+            config_path = workspace / ".codex" / "config.toml"
+            agents_path = workspace / "AGENTS.md"
+
+            (installed_root / "scripts").mkdir(parents=True, exist_ok=True)
+            (installed_root / "scripts" / "marker.txt").write_text("old-plugin\n", encoding="utf-8")
+            marketplace_path.parent.mkdir(parents=True, exist_ok=True)
+            marketplace_path.write_text(json.dumps({"plugins": [{"name": "existing"}]}) + "\n", encoding="utf-8")
+            hooks_path.parent.mkdir(parents=True, exist_ok=True)
+            hooks_path.write_text(json.dumps({"hooks": {"PostToolUse": []}}) + "\n", encoding="utf-8")
+            config_path.write_text("[features]\ncodex_hooks = false\n", encoding="utf-8")
+            agents_path.write_text("# Existing workspace policy\n", encoding="utf-8")
+
+            original_write_file = install_local.InstallTransaction.write_file
+
+            def interrupt_after_agents(self: install_local.InstallTransaction, path: Path, content: str) -> bool:
+                changed = original_write_file(self, path, content)
+                if path.name == "AGENTS.md":
+                    raise KeyboardInterrupt()
+                return changed
+
+            argv = ["install_local.py", "--workspace", str(workspace)]
+            with (
+                mock.patch.object(Path, "home", return_value=fake_home),
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(install_local.InstallTransaction, "write_file", new=interrupt_after_agents),
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    install_local.main()
+
+            self.assertEqual((installed_root / "scripts" / "marker.txt").read_text(encoding="utf-8"), "old-plugin\n")
+            self.assertEqual(agents_path.read_text(encoding="utf-8"), "# Existing workspace policy\n")
+            self.assertEqual(config_path.read_text(encoding="utf-8"), "[features]\ncodex_hooks = false\n")
+            self.assertEqual(json.loads(hooks_path.read_text(encoding="utf-8")), {"hooks": {"PostToolUse": []}})
+            self.assertEqual(json.loads(marketplace_path.read_text(encoding="utf-8")), {"plugins": [{"name": "existing"}]})
+
+    def test_main_rolls_back_new_files_and_plugin_install_on_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as home_dir, tempfile.TemporaryDirectory() as workspace_dir:
+            fake_home = Path(home_dir)
+            workspace = Path(workspace_dir)
+            installed_root = fake_home / ".codex" / "plugins" / "pounce"
+            marketplace_path = fake_home / ".agents" / "plugins" / "marketplace.json"
+
+            original_write_file = install_local.InstallTransaction.write_file
+
+            def interrupt_after_marketplace(self: install_local.InstallTransaction, path: Path, content: str) -> bool:
+                changed = original_write_file(self, path, content)
+                if path == marketplace_path:
+                    raise KeyboardInterrupt()
+                return changed
+
+            argv = ["install_local.py", "--workspace", str(workspace)]
+            with (
+                mock.patch.object(Path, "home", return_value=fake_home),
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(install_local.InstallTransaction, "write_file", new=interrupt_after_marketplace),
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    install_local.main()
+
+            self.assertFalse(installed_root.exists())
+            self.assertFalse(marketplace_path.exists())
+            self.assertFalse((workspace / "AGENTS.md").exists())
+            self.assertFalse((workspace / ".codex" / "hooks.json").exists())
+            self.assertFalse((workspace / ".codex" / "config.toml").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

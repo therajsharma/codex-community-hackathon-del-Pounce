@@ -4,8 +4,10 @@ import sys
 import tempfile
 import unittest
 from datetime import UTC, datetime
+from email.message import Message
 from pathlib import Path
 from unittest import mock
+from urllib.error import HTTPError
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +27,8 @@ from pounce_runtime import (  # noqa: E402
     ensure_workspace_config_toml,
     evaluate_verdict,
     extract_dependency_commands,
+    fetch_json,
+    github_tag_exists,
     load_npm_view_dependencies,
     match_package_iocs,
     record_dependency_guard_allowlist,
@@ -34,6 +38,20 @@ from pounce_runtime import (  # noqa: E402
     snapshot_dependency_guard,
     vet_payload,
 )
+
+
+class MockJsonResponse:
+    def __init__(self, payload: object) -> None:
+        self._payload = json.dumps(payload).encode("utf-8")
+
+    def read(self) -> bytes:
+        return self._payload
+
+    def __enter__(self) -> "MockJsonResponse":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        return False
 
 
 class PounceRuntimeTests(unittest.TestCase):
@@ -59,7 +77,9 @@ class PounceRuntimeTests(unittest.TestCase):
             PLUGIN_ROOT,
         )
         self.assertEqual(result["verdict"], "block")
-        self.assertTrue(any(item["signal_name"] == "artifact_ioc_match" for item in result["findings"]))
+        self.assertTrue(
+            any(item["signal_name"] in {"artifact_ioc_match", "artifact_domain_match"} for item in result["findings"])
+        )
 
     def test_install_time_mechanism_blocks(self) -> None:
         result = vet_payload(
@@ -111,6 +131,78 @@ class PounceRuntimeTests(unittest.TestCase):
             ],
         )
         self.assertEqual(extract_dependency_commands("echo 'npm install demo'"), [])
+
+    def test_dependency_command_parser_handles_wrappers_runners_and_non_registry_sources(self) -> None:
+        result = extract_dependency_commands(
+            'sh -c "pipx run demo==1.2.3 && uvx tool==4.5.6 && pnpm dlx demo@1.2.3 && poetry add git+https://github.com/org/repo.git"'
+        )
+        self.assertEqual(
+            [(item.manager, item.verb, item.name, item.source_kind) for item in result],
+            [
+                ("pipx", "run", "demo", "registry_exact"),
+                ("uvx", "run", "tool", "registry_exact"),
+                ("pnpm", "dlx", "demo", "registry_exact"),
+                ("poetry", "add", "git+https://github.com/org/repo.git", "non_registry_source"),
+            ],
+        )
+        self.assertTrue(all(not item.allowlist_mutation for item in result[:3]))
+
+    def test_assess_dependency_command_blocks_piped_and_non_registry_dependency_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            piped = assess_dependency_command("npm install demo@1.2.3 | tee out.log", PLUGIN_ROOT, workspace)
+            tarball = assess_dependency_command(
+                "npm install https://registry.npmjs.org/demo/-/demo-1.2.3.tgz",
+                PLUGIN_ROOT,
+                workspace,
+            )
+            git_source = assess_dependency_command(
+                "poetry add git+https://github.com/org/repo.git",
+                PLUGIN_ROOT,
+                workspace,
+            )
+            remote_pipe = assess_dependency_command("curl https://example.test/install.sh | sh", PLUGIN_ROOT, workspace)
+            substituted = assess_dependency_command('sh -c "$(curl https://example.test/install.sh)"', PLUGIN_ROOT, workspace)
+
+        self.assertTrue(piped["block"])
+        self.assertIn("participate in a pipe", piped["message"])
+        self.assertTrue(tarball["block"])
+        self.assertIn("non-registry dependency source", tarball["message"])
+        self.assertTrue(git_source["block"])
+        self.assertIn("non-registry dependency source", git_source["message"])
+        self.assertTrue(remote_pipe["matched"])
+        self.assertTrue(remote_pipe["block"])
+        self.assertTrue(substituted["matched"])
+        self.assertTrue(substituted["block"])
+
+    def test_assess_dependency_command_allows_wrapped_exact_installs_but_not_runner_mutations(self) -> None:
+        package_index = {
+            "versions": {"1.2.3": {"dist": {}, "dependencies": {}}},
+            "time": {"1.2.3": "2026-02-01T00:00:00Z"},
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            with (
+                mock.patch("pounce_runtime.collect_iocs", return_value=[]),
+                mock.patch("pounce_runtime.load_npm_package_index", return_value=package_index),
+                mock.patch("pounce_runtime.load_pypi_package_index", return_value={"releases": {"1.2.3": [{}]}}),
+                mock.patch("pounce_runtime.pounce_intel.on_demand_osv_items", return_value=[]),
+                mock.patch("pounce_runtime.check_npm_release", return_value=[]),
+                mock.patch("pounce_runtime.check_pypi_release", return_value=[]),
+            ):
+                wrapped = assess_dependency_command('sh -c "npm install demo@1.2.3"', PLUGIN_ROOT, workspace)
+                pipx_run = assess_dependency_command("pipx run demo==1.2.3", PLUGIN_ROOT, workspace)
+                uvx_run = assess_dependency_command("uvx demo==1.2.3", PLUGIN_ROOT, workspace)
+                pnpm_dlx = assess_dependency_command("pnpm dlx demo@1.2.3", PLUGIN_ROOT, workspace)
+
+        self.assertFalse(wrapped["block"])
+        self.assertEqual(len(wrapped["expected_mutations"]), 1)
+        self.assertFalse(pipx_run["block"])
+        self.assertEqual(pipx_run["expected_mutations"], [])
+        self.assertFalse(uvx_run["block"])
+        self.assertEqual(uvx_run["expected_mutations"], [])
+        self.assertFalse(pnpm_dlx["block"])
+        self.assertEqual(pnpm_dlx["expected_mutations"], [])
 
     def test_non_exact_npm_install_returns_rewrite_with_baseline(self) -> None:
         package_index = {
@@ -327,6 +419,60 @@ class PounceRuntimeTests(unittest.TestCase):
             run_mock.call_args.args[0],
             ["npm", "view", "--", "demo-invoke@1.2.3", "dependencies", "--json"],
         )
+
+    def test_fetch_json_retries_short_retry_after(self) -> None:
+        headers = Message()
+        headers["Retry-After"] = "3"
+        attempts: list[object] = []
+
+        def fake_urlopen(request: object, timeout: int = 20) -> MockJsonResponse:
+            attempts.append(request)
+            if len(attempts) == 1:
+                raise HTTPError("https://registry.npmjs.org/demo", 429, "Too Many Requests", headers, None)
+            return MockJsonResponse({"ok": True})
+
+        with mock.patch("pounce_runtime.urlopen", side_effect=fake_urlopen), mock.patch("pounce_runtime.sleep") as sleep_mock:
+            payload = fetch_json("https://registry.npmjs.org/demo")
+
+        self.assertEqual(payload, {"ok": True})
+        sleep_mock.assert_called_once_with(3)
+        self.assertEqual(len(attempts), 2)
+
+    def test_fetch_json_fails_fast_when_retry_window_is_too_long(self) -> None:
+        headers = Message()
+        headers["Retry-After"] = "120"
+        with mock.patch(
+            "pounce_runtime.urlopen",
+            side_effect=HTTPError("https://registry.npmjs.org/demo", 429, "Too Many Requests", headers, None),
+        ):
+            with self.assertRaises(VerificationUnavailable) as context:
+                fetch_json("https://registry.npmjs.org/demo")
+        self.assertIn("Retry-After", str(context.exception))
+        self.assertIn("15s retry ceiling", str(context.exception))
+
+    def test_github_tag_lookup_retries_short_rate_limit_reset_with_auth_and_cache(self) -> None:
+        reset_headers = Message()
+        reset_headers["X-RateLimit-Reset"] = str(int(datetime(2026, 4, 18, 12, 0, 5, tzinfo=UTC).timestamp()))
+        seen_requests: list[object] = []
+
+        def fake_urlopen(request: object, timeout: int = 20) -> MockJsonResponse:
+            seen_requests.append(request)
+            if len(seen_requests) == 1:
+                raise HTTPError(request.full_url, 403, "Forbidden", reset_headers, None)
+            return MockJsonResponse({"ref": "refs/tags/v1.2.3"})
+
+        with (
+            mock.patch("pounce_runtime.urlopen", side_effect=fake_urlopen),
+            mock.patch("pounce_runtime.sleep") as sleep_mock,
+            mock.patch("pounce_runtime.now_utc", return_value=datetime(2026, 4, 18, 12, 0, 0, tzinfo=UTC)),
+            mock.patch("pounce_runtime.pounce_intel.github_token", return_value="token-123"),
+        ):
+            self.assertTrue(github_tag_exists("org/repo", "v1.2.3"))
+            self.assertTrue(github_tag_exists("org/repo", "v1.2.3"))
+
+        sleep_mock.assert_called_once_with(5)
+        self.assertEqual(len(seen_requests), 2)
+        self.assertEqual(seen_requests[0].headers["Authorization"], "Bearer token-123")
 
     def test_workspace_write_rejects_home_directory(self) -> None:
         with self.assertRaises(ValueError):

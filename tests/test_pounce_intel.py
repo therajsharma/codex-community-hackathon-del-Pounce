@@ -65,6 +65,39 @@ class PounceIntelTests(unittest.TestCase):
         self.assertEqual(feed["items"][0]["action"], "block")
         self.assertEqual(feed["items"][1]["match"]["type"], "string")
 
+    def test_normalize_normalized_seed_payload_preserves_domain_warn_and_metadata(self) -> None:
+        payload = {
+            "schema_version": "1.0",
+            "generated_at": "2026-04-18T00:00:00Z",
+            "items": [
+                {
+                    "id": "ioc-domain-warn",
+                    "kind": "ioc_domain",
+                    "match": {"type": "domain", "value": "sfrclak.com"},
+                    "action": "warn",
+                    "confidence": 0.8,
+                    "reason": "Warning-only domain intelligence.",
+                    "source": "github_advisory",
+                    "source_refs": [{"kind": "ghsa", "id": "GHSA-demo"}],
+                    "published_at": "2026-04-10T00:00:00Z",
+                    "modified_at": "2026-04-11T00:00:00Z",
+                    "first_seen": "2026-04-10T00:00:00Z",
+                    "last_seen": "2026-04-11T00:00:00Z",
+                }
+            ],
+        }
+
+        feed = pounce_intel.normalize_feed_artifact(payload, observed_at="2026-04-18T00:00:00Z", default_source="seed_ioc")
+        item = feed["items"][0]
+        self.assertEqual(item["match"]["type"], "domain")
+        self.assertEqual(item["match"]["value"], "sfrclak.com")
+        self.assertEqual(item["action"], "warn")
+        self.assertEqual(item["source_refs"], [{"kind": "ghsa", "id": "GHSA-demo"}])
+        self.assertEqual(item["published_at"], "2026-04-10T00:00:00Z")
+        self.assertEqual(item["modified_at"], "2026-04-11T00:00:00Z")
+        self.assertEqual(item["first_seen"], "2026-04-10T00:00:00Z")
+        self.assertEqual(item["last_seen"], "2026-04-11T00:00:00Z")
+
     def test_active_feed_items_skip_revoked_and_expired_records(self) -> None:
         items = [
             {

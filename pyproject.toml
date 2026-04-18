@@ -1,0 +1,6 @@
+[project]
+name = "pounce"
+version = "0.0.0"
+description = "Codex-native dependency vetting and supply-chain guardrails."
+readme = "README.md"
+

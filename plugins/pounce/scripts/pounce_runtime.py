@@ -12,8 +12,10 @@ import shlex
 import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any
+from time import sleep
+from typing import Any, Literal, NotRequired, TypedDict
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
@@ -28,6 +30,8 @@ LIVE_IOC_TTL = timedelta(minutes=10)
 MAX_SCAN_FILE_SIZE = 512 * 1024
 MAX_SCAN_FILE_COUNT = 1000
 MAX_NPM_GRAPH_NODES = 250
+MAX_HTTP_BACKOFF_SECONDS = 15
+MAX_HTTP_RETRIES = 3
 POUNCE_HOOK_STATUS_MESSAGE = "Pounce vetting dependency command"
 GUARD_STATE_DIRNAME = "guard"
 WORKSPACE_RESERVED_DIRS = {".codex", ".pounce"}
@@ -87,10 +91,13 @@ PACKAGE_JSON_DEPENDENCY_SECTIONS = (
 )
 COMMAND_PATTERNS = (
     (("uv", "pip", "install"), "pypi", "uv", "install"),
+    (("pipx", "run"), "pypi", "pipx", "run"),
+    (("uvx",), "pypi", "uvx", "run"),
     (("npm", "install"), "npm", "npm", "install"),
     (("npm", "i"), "npm", "npm", "i"),
     (("npm", "add"), "npm", "npm", "add"),
     (("pnpm", "add"), "npm", "pnpm", "add"),
+    (("pnpm", "dlx"), "npm", "pnpm", "dlx"),
     (("pnpm", "up"), "npm", "pnpm", "up"),
     (("yarn", "add"), "npm", "yarn", "add"),
     (("yarn", "up"), "npm", "yarn", "up"),
@@ -134,8 +141,17 @@ COMMAND_FLAGS_WITH_VALUES = {
         "--python",
     },
     "uv": {"--group", "--extra", "-c", "--constraint", "-r", "--requirement", "--python"},
+    "pipx": {"--python", "--index-url", "--pip-args"},
+    "uvx": {"--python"},
     "poetry": {"--group", "-G", "--source"},
 }
+DEPENDENCY_FLAG_VALUES = {
+    "pipx": {"--spec"},
+    "uvx": {"--from"},
+}
+SHELL_WRAPPER_COMMANDS = {"sh", "bash", "zsh"}
+REMOTE_FETCH_COMMANDS = {"curl", "wget"}
+PIPE_SEPARATOR = "|"
 NPM_EXACT_SAVE_FLAGS = {
     ("npm", "install"): "--save-exact",
     ("npm", "i"): "--save-exact",
@@ -188,7 +204,59 @@ _IOC_CACHE: dict[str, Any] = {"expires_at": datetime.fromtimestamp(0, tz=UTC), "
 _LAST_GOOD_IOCS: list[dict[str, Any]] = []
 _HTTP_CACHE: dict[str, Any] = {}
 _NPM_VIEW_CACHE: dict[str, dict[str, str]] = {}
+_GITHUB_TAG_CACHE: dict[tuple[str, str], bool] = {}
 _LAST_INTEL_CONTEXT: dict[str, Any] = {"feed": {"items": []}, "warnings": []}
+
+Verdict = Literal["block", "warn", "allow"]
+DependencySourceKind = Literal["registry_exact", "registry_non_exact", "non_registry_source"]
+
+
+class Finding(TypedDict):
+    signal_id: str
+    signal_name: str
+    category: str
+    severity: str
+    verdict_impact: Verdict
+    evidence: str
+    source: str
+    artifact: str
+    count_toward_block: bool
+    metadata: NotRequired[dict[str, Any]]
+
+
+class VetResult(TypedDict):
+    verdict: Verdict
+    summary: str
+    findings: list[Finding]
+    checked_at: str
+    stamp_path: str | None
+    recommended_version: str | None
+    recommended_command: str | None
+    baseline_version: str | None
+    baseline_source: str | None
+    next_action: str | None
+    intel_selected_from: str | None
+    verification_status: str
+    manual_review_required: bool
+
+
+class DependencyMutation(TypedDict):
+    ecosystem: str
+    manager: str
+    verb: str
+    name: str
+    expected_version: str
+    command: str
+
+
+class DependencyAssessment(TypedDict):
+    matched: bool
+    block: bool
+    message: str | None
+    results: list[VetResult]
+    expected_mutations: list[DependencyMutation]
+    recommended_command: str | None
+    next_action: str | None
 
 
 class VerificationUnavailable(Exception):
@@ -203,23 +271,40 @@ class DependencyCommand:
     name: str
     version_spec: str | None
     original: str
-    spec_kind: str
+    source_kind: DependencySourceKind
+    source_detail: str | None
     segment_index: int
     token_index: int
+    allowlist_mutation: bool
+    piped: bool
 
     @property
     def exact(self) -> bool:
-        return self.spec_kind == "exact"
+        return self.source_kind == "registry_exact"
 
     @property
     def version(self) -> str | None:
         return self.version_spec if self.exact else None
 
     @property
+    def spec_kind(self) -> str:
+        if self.source_kind == "registry_exact":
+            return "exact"
+        if self.source_kind == "registry_non_exact":
+            return "range" if self.version_spec else "unpinned"
+        return "non_registry"
+
+    @property
+    def non_registry(self) -> bool:
+        return self.source_kind == "non_registry_source"
+
+    @property
     def artifact(self) -> str:
         if self.version:
             separator = "==" if self.ecosystem == "pypi" else "@"
             return f"{self.name}{separator}{self.version}"
+        if self.non_registry:
+            return self.original
         return self.name
 
 
@@ -233,6 +318,7 @@ class DependencyCommandSegment:
     manager: str
     verb: str
     index: int
+    piped: bool
     dependencies: list[DependencyCommand]
 
 
@@ -274,33 +360,127 @@ def truncate(value: str, limit: int = 240) -> str:
     return value[: limit - 3] + "..."
 
 
+def github_request_headers(headers: dict[str, str] | None = None) -> dict[str, str]:
+    token = pounce_intel.github_token()
+    if not token:
+        return dict(headers or {})
+    return {
+        **(headers or {}),
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def parse_retry_after_delay(value: str | None) -> int | None:
+    if not value:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    if raw.isdigit():
+        return max(0, int(raw))
+    try:
+        parsed = parsedate_to_datetime(raw)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    delay = int((parsed.astimezone(UTC) - now_utc()).total_seconds())
+    return max(0, delay)
+
+
+def parse_rate_limit_reset_delay(value: str | None) -> int | None:
+    if not value:
+        return None
+    try:
+        reset_at = datetime.fromtimestamp(int(value.strip()), tz=UTC)
+    except (OverflowError, ValueError):
+        return None
+    delay = int((reset_at - now_utc()).total_seconds())
+    return max(0, delay)
+
+
+def retry_delay_for_error(exc: HTTPError) -> tuple[int | None, str | None]:
+    headers = exc.headers or {}
+    retry_after = parse_retry_after_delay(headers.get("Retry-After"))
+    if retry_after is not None:
+        return retry_after, "Retry-After"
+    if exc.code in {403, 429}:
+        rate_limit_reset = parse_rate_limit_reset_delay(headers.get("X-RateLimit-Reset"))
+        if rate_limit_reset is not None:
+            return rate_limit_reset, "X-RateLimit-Reset"
+    return None, None
+
+
+def throttled_verification_message(url: str, exc: HTTPError, delay_seconds: int, header_name: str) -> str:
+    return (
+        f"{url} returned HTTP {exc.code} and requested a {delay_seconds}s backoff via {header_name}, "
+        f"which exceeds the {MAX_HTTP_BACKOFF_SECONDS}s retry ceiling."
+    )
+
+
+def fetch_response_text(
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    timeout: int = 20,
+    allow_404: bool = False,
+) -> str | None:
+    request_headers = {
+        "Accept": "application/json",
+        "User-Agent": "pounce-local-plugin",
+        **(headers or {}),
+    }
+    last_http_error: HTTPError | None = None
+    for attempt in range(MAX_HTTP_RETRIES):
+        request = Request(url, headers=request_headers)
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                return response.read().decode("utf-8")
+        except HTTPError as exc:
+            if allow_404 and exc.code == 404:
+                return None
+            last_http_error = exc
+            delay_seconds, header_name = retry_delay_for_error(exc)
+            if (
+                delay_seconds is not None
+                and header_name is not None
+                and delay_seconds <= MAX_HTTP_BACKOFF_SECONDS
+                and attempt < MAX_HTTP_RETRIES - 1
+            ):
+                sleep(delay_seconds)
+                continue
+            if delay_seconds is not None and header_name is not None:
+                raise VerificationUnavailable(throttled_verification_message(url, exc, delay_seconds, header_name)) from exc
+            raise VerificationUnavailable(f"{url} returned HTTP {exc.code}") from exc
+        except URLError as exc:
+            raise VerificationUnavailable(f"{url} could not be reached: {exc.reason}") from exc
+    assert last_http_error is not None
+    raise VerificationUnavailable(f"{url} returned HTTP {last_http_error.code}")
+
+
 def fetch_json(
     url: str,
     *,
     headers: dict[str, str] | None = None,
     timeout: int = 20,
     cache_key: str | None = None,
+    allow_404: bool = False,
 ) -> Any:
     if cache_key and cache_key in _HTTP_CACHE:
         return _HTTP_CACHE[cache_key]
 
-    request = Request(
-        url,
-        headers={
-            "Accept": "application/json",
-            "User-Agent": "pounce-local-plugin",
-            **(headers or {}),
-        },
-    )
     try:
-        with urlopen(request, timeout=timeout) as response:
-            payload = json.load(response)
-    except HTTPError as exc:
-        raise VerificationUnavailable(f"{url} returned HTTP {exc.code}") from exc
-    except URLError as exc:
-        raise VerificationUnavailable(f"{url} could not be reached: {exc.reason}") from exc
+        response_text = fetch_response_text(url, headers=headers, timeout=timeout, allow_404=allow_404)
+        if response_text is None:
+            return None
+        payload = json.loads(response_text)
+    except VerificationUnavailable:
+        raise
+    except json.JSONDecodeError as exc:
+        raise VerificationUnavailable(f"{url} returned malformed JSON.") from exc
 
-    if cache_key:
+    if cache_key and payload is not None:
         _HTTP_CACHE[cache_key] = payload
     return payload
 
@@ -333,7 +513,7 @@ def runtime_plugin_root() -> Path:
     return plugin_root_from_script(__file__)
 
 
-def make_validation_finding(*, artifact: str, detail: str, source: str = "input") -> dict[str, Any]:
+def make_validation_finding(*, artifact: str, detail: str, source: str = "input") -> Finding:
     return make_finding(
         signal_id="invalid-input",
         signal_name="invalid_input",
@@ -461,14 +641,14 @@ def make_finding(
     signal_name: str,
     category: str,
     severity: str,
-    verdict_impact: str,
+    verdict_impact: Verdict,
     evidence: str,
     source: str,
     artifact: str,
     count_toward_block: bool = True,
     metadata: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    finding = {
+) -> Finding:
+    finding: Finding = {
         "signal_id": signal_id,
         "signal_name": signal_name,
         "category": category,
@@ -504,7 +684,7 @@ def build_verification_unavailable(
     source: str,
     artifact: str,
     detail: str,
-) -> dict[str, Any]:
+) -> Finding:
     return make_finding(
         signal_id="verification-unavailable",
         signal_name="verification_unavailable",
@@ -672,30 +852,32 @@ def normalize_github_repo(repository_value: Any) -> str | None:
 
 
 def github_tag_exists(repo_slug: str, tag: str) -> bool:
+    cache_key = (repo_slug, tag)
+    if cache_key in _GITHUB_TAG_CACHE:
+        return _GITHUB_TAG_CACHE[cache_key]
     quoted = quote(tag, safe="")
     endpoints = (
         f"https://api.github.com/repos/{repo_slug}/git/ref/tags/{quoted}",
         f"https://api.github.com/repos/{repo_slug}/releases/tags/{quoted}",
     )
-    last_error: str | None = None
     for endpoint in endpoints:
         try:
-            request = Request(endpoint, headers={"User-Agent": "pounce-local-plugin"})
-            with urlopen(request, timeout=20):
-                pass
+            payload = fetch_json(
+                endpoint,
+                headers=github_request_headers({"Accept": "application/vnd.github+json"}),
+                cache_key=f"github-tag:{repo_slug}:{tag}:{endpoint}",
+                allow_404=True,
+            )
+        except VerificationUnavailable as exc:
+            raise VerificationUnavailable(f"GitHub tag verification was unavailable: {exc}") from exc
+        if isinstance(payload, dict):
+            _GITHUB_TAG_CACHE[cache_key] = True
             return True
-        except HTTPError as exc:
-            if exc.code == 404:
-                continue
-            last_error = f"{endpoint} returned HTTP {exc.code}"
-        except URLError as exc:
-            last_error = f"{endpoint} could not be reached: {exc.reason}"
-    if last_error:
-        raise VerificationUnavailable(last_error)
+    _GITHUB_TAG_CACHE[cache_key] = False
     return False
 
 
-def check_github_tag(repo_slug: str, version: str, artifact: str) -> list[dict[str, Any]]:
+def check_github_tag(repo_slug: str, version: str, artifact: str) -> list[Finding]:
     candidates = (f"v{version}", version)
     for candidate in candidates:
         try:
@@ -706,7 +888,7 @@ def check_github_tag(repo_slug: str, version: str, artifact: str) -> list[dict[s
                 build_verification_unavailable(
                     source="github",
                     artifact=artifact,
-                    detail=f"GitHub tag verification was unavailable: {exc}",
+                    detail=str(exc),
                 )
             ]
     return [
@@ -1360,7 +1542,7 @@ def check_pypi_release(package_name: str, version: str) -> list[dict[str, Any]]:
     return findings
 
 
-def evaluate_verdict(findings: list[dict[str, Any]]) -> str:
+def evaluate_verdict(findings: list[Finding]) -> Verdict:
     if any(finding["verdict_impact"] == "block" for finding in findings):
         return "block"
     if any(finding["verdict_impact"] == "warn" for finding in findings):
@@ -2200,7 +2382,7 @@ def vet_payload(
     *,
     write_stamp_enabled: bool = True,
     allowed_workspace_root: Path | None = None,
-) -> dict[str, Any]:
+) -> VetResult:
     mode = str(payload.get("mode", "release")).strip().lower()
     ecosystem = normalize_ecosystem(payload.get("ecosystem"))
     package_name = str(payload.get("package_name", "")).strip()
@@ -2224,7 +2406,7 @@ def vet_payload(
         if isinstance(_LAST_INTEL_CONTEXT, dict)
         else ""
     ) or None
-    findings: list[dict[str, Any]] = []
+    findings: list[Finding] = []
     recommended_version: str | None = None
     recommended_command: str | None = None
     baseline_version: str | None = None
@@ -2349,7 +2531,7 @@ def vet_payload(
             scan_mechanisms("\n".join(artifacts), source="install_scan", artifact=artifact or "artifacts")
         )
 
-    deduped_findings: list[dict[str, Any]] = []
+    deduped_findings: list[Finding] = []
     seen_findings: set[tuple[str, str, str]] = set()
     for finding in findings:
         key = (str(finding.get("signal_id")), str(finding.get("artifact")), str(finding.get("source")))
@@ -2438,6 +2620,13 @@ def split_shell_segments(command: str) -> list[tuple[str, str | None]]:
                     segments.append((raw, next_two))
                 buffer = []
                 index += 2
+                continue
+            if char == PIPE_SEPARATOR:
+                raw = "".join(buffer).strip()
+                if raw:
+                    segments.append((raw, PIPE_SEPARATOR))
+                buffer = []
+                index += 1
                 continue
             if char == ";" or (char == "\n" and previous != "\\"):
                 raw = "".join(buffer).strip()
@@ -2541,14 +2730,203 @@ def flag_takes_value(manager: str, token: str) -> bool:
     return token in COMMAND_FLAGS_WITH_VALUES.get(manager, set())
 
 
-def extract_dependency_segments(command: str) -> list[DependencyCommandSegment]:
+def shell_wrapper_payload(tokens: list[str]) -> str | None:
+    if not tokens or tokens[0] not in SHELL_WRAPPER_COMMANDS:
+        return None
+    for index, token in enumerate(tokens[1:], start=1):
+        if index + 1 >= len(tokens):
+            continue
+        if token == "-c" or (token.startswith("-") and "c" in token[1:]):
+            return tokens[index + 1]
+    return None
+
+
+def non_registry_source_detail(value: str) -> str | None:
+    candidate = value.strip()
+    lowered = candidate.lower()
+    if not candidate:
+        return None
+    if lowered.startswith(("git+", "git://", "github:")) or candidate.startswith("git@"):
+        return "git"
+    if lowered.startswith("file:"):
+        return "file"
+    if "://" in candidate:
+        if lowered.endswith((".tgz", ".tar.gz", ".tar", ".whl", ".zip")):
+            return "tarball"
+        return "url"
+    if candidate in {".", ".."} or candidate.startswith(("/", "./", "../", "~/")):
+        if lowered.endswith((".tgz", ".tar.gz", ".tar", ".whl", ".zip")):
+            return "tarball"
+        return "local_path"
+    if lowered.endswith((".tgz", ".tar.gz", ".tar", ".whl", ".zip")) and any(
+        marker in candidate for marker in ("/", "\\")
+    ):
+        return "tarball"
+    return None
+
+
+def classify_npm_dependency_token(token: str) -> tuple[str, str | None, DependencySourceKind, str | None] | None:
+    candidate = token.strip()
+    if not candidate:
+        return None
+    name, version_spec, spec_kind = parse_npm_spec(candidate)
+    if version_spec:
+        detail = non_registry_source_detail(version_spec)
+        if detail:
+            return name.strip() or candidate, version_spec.strip(), "non_registry_source", detail
+    detail = non_registry_source_detail(candidate)
+    if detail:
+        return name.strip() or candidate, (version_spec or "").strip() or None, "non_registry_source", detail
+    normalized_name = name.strip()
+    if not normalized_name:
+        return None
+    source_kind: DependencySourceKind = "registry_exact" if spec_kind == "exact" else "registry_non_exact"
+    return normalized_name, (version_spec or "").strip() or None, source_kind, None
+
+
+def classify_python_dependency_token(token: str) -> tuple[str, str | None, DependencySourceKind, str | None] | None:
+    candidate = token.strip()
+    if not candidate:
+        return None
+    detail = non_registry_source_detail(candidate)
+    if detail:
+        return candidate, None, "non_registry_source", detail
+    name, version_spec, spec_kind = parse_python_spec(candidate)
+    normalized_name = name.strip()
+    if not normalized_name:
+        return None
+    source_kind: DependencySourceKind = "registry_exact" if spec_kind == "exact" else "registry_non_exact"
+    return normalized_name, (version_spec or "").strip() or None, source_kind, None
+
+
+def build_dependency_command(
+    *,
+    ecosystem: str,
+    manager: str,
+    verb: str,
+    token: str,
+    segment_index: int,
+    token_index: int,
+    piped: bool,
+) -> DependencyCommand | None:
+    classified = (
+        classify_npm_dependency_token(token)
+        if ecosystem == "npm"
+        else classify_python_dependency_token(token)
+    )
+    if classified is None:
+        return None
+    name, version_spec, source_kind, source_detail = classified
+    return DependencyCommand(
+        ecosystem=ecosystem,
+        manager=manager,
+        verb=verb,
+        name=name,
+        version_spec=version_spec,
+        original=token,
+        source_kind=source_kind,
+        source_detail=source_detail,
+        segment_index=segment_index,
+        token_index=token_index,
+        allowlist_mutation=(manager, verb) not in {("pipx", "run"), ("uvx", "run"), ("pnpm", "dlx")},
+        piped=piped,
+    )
+
+
+def extract_dependencies_from_tokens(
+    tokens: list[str],
+    *,
+    prefix_length: int,
+    ecosystem: str,
+    manager: str,
+    verb: str,
+    segment_index: int,
+    piped: bool,
+) -> list[DependencyCommand]:
+    dependencies: list[DependencyCommand] = []
+    token_index = prefix_length
+    runner_mode = (manager, verb) in {("pipx", "run"), ("uvx", "run"), ("pnpm", "dlx")}
+    runner_consumed = False
+
+    while token_index < len(tokens):
+        token = tokens[token_index]
+        if token == "--":
+            if runner_mode:
+                break
+            token_index += 1
+            continue
+        if token.startswith("-"):
+            if token in DEPENDENCY_FLAG_VALUES.get(manager, set()) and token_index + 1 < len(tokens):
+                if not runner_consumed:
+                    dependency = build_dependency_command(
+                        ecosystem=ecosystem,
+                        manager=manager,
+                        verb=verb,
+                        token=tokens[token_index + 1],
+                        segment_index=segment_index,
+                        token_index=token_index + 1,
+                        piped=piped,
+                    )
+                    if dependency is not None:
+                        dependencies.append(dependency)
+                        runner_consumed = True
+                token_index += 2
+                continue
+            if flag_takes_value(manager, token) and token_index + 1 < len(tokens):
+                token_index += 2
+            else:
+                token_index += 1
+            continue
+        if runner_mode and runner_consumed:
+            token_index += 1
+            continue
+        dependency = build_dependency_command(
+            ecosystem=ecosystem,
+            manager=manager,
+            verb=verb,
+            token=token,
+            segment_index=segment_index,
+            token_index=token_index,
+            piped=piped,
+        )
+        if dependency is not None:
+            dependencies.append(dependency)
+            if runner_mode:
+                runner_consumed = True
+        token_index += 1
+    return dependencies
+
+
+def collect_dependency_segments(
+    command: str,
+    *,
+    inherited_piped: bool = False,
+    start_index: int = 0,
+) -> tuple[list[DependencyCommandSegment], int]:
     segments: list[DependencyCommandSegment] = []
-    for index, (raw, separator) in enumerate(split_shell_segments(command)):
+    previous_separator: str | None = None
+    next_index = start_index
+
+    for raw, separator in split_shell_segments(command):
         try:
             tokens = shlex.split(raw)
         except ValueError:
+            previous_separator = separator
             continue
         if not tokens:
+            previous_separator = separator
+            continue
+
+        piped = inherited_piped or previous_separator == PIPE_SEPARATOR or separator == PIPE_SEPARATOR
+        wrapper_payload = shell_wrapper_payload(tokens)
+        if wrapper_payload is not None:
+            nested_segments, next_index = collect_dependency_segments(
+                wrapper_payload,
+                inherited_piped=piped,
+                start_index=next_index,
+            )
+            segments.extend(nested_segments)
+            previous_separator = separator
             continue
 
         matched_pattern: tuple[tuple[str, ...], str, str, str] | None = None
@@ -2558,41 +2936,19 @@ def extract_dependency_segments(command: str) -> list[DependencyCommandSegment]:
                 matched_pattern = (prefix, ecosystem, manager, verb)
                 break
         if matched_pattern is None:
+            previous_separator = separator
             continue
 
         prefix, ecosystem, manager, verb = matched_pattern
-        dependencies: list[DependencyCommand] = []
-        token_index = len(prefix)
-        while token_index < len(tokens):
-            token = tokens[token_index]
-            if token.startswith("-"):
-                if flag_takes_value(manager, token) and token_index + 1 < len(tokens):
-                    token_index += 2
-                else:
-                    token_index += 1
-                continue
-            if token in {".", ".."} or "://" in token:
-                token_index += 1
-                continue
-            if ecosystem == "npm":
-                name, version_spec, spec_kind = parse_npm_spec(token)
-            else:
-                name, version_spec, spec_kind = parse_python_spec(token)
-            if name.strip():
-                dependencies.append(
-                    DependencyCommand(
-                        ecosystem=ecosystem,
-                        manager=manager,
-                        verb=verb,
-                        name=name.strip(),
-                        version_spec=(version_spec or "").strip() or None,
-                        original=token,
-                        spec_kind=spec_kind,
-                        segment_index=index,
-                        token_index=token_index,
-                    )
-                )
-            token_index += 1
+        dependencies = extract_dependencies_from_tokens(
+            tokens,
+            prefix_length=len(prefix),
+            ecosystem=ecosystem,
+            manager=manager,
+            verb=verb,
+            segment_index=next_index,
+            piped=piped,
+        )
 
         if dependencies:
             segments.append(
@@ -2604,10 +2960,18 @@ def extract_dependency_segments(command: str) -> list[DependencyCommandSegment]:
                     ecosystem=ecosystem,
                     manager=manager,
                     verb=verb,
-                    index=index,
+                    index=next_index,
+                    piped=piped,
                     dependencies=dependencies,
                 )
             )
+            next_index += 1
+        previous_separator = separator
+    return segments, next_index
+
+
+def extract_dependency_segments(command: str) -> list[DependencyCommandSegment]:
+    segments, _ = collect_dependency_segments(command)
     return segments
 
 
@@ -2616,6 +2980,53 @@ def extract_dependency_commands(command: str) -> list[DependencyCommand]:
     for segment in extract_dependency_segments(command):
         commands.extend(segment.dependencies)
     return commands
+
+
+def command_contains_remote_fetch_substitution(command: str) -> bool:
+    for raw, _ in split_shell_segments(command):
+        try:
+            tokens = shlex.split(raw)
+        except ValueError:
+            continue
+        wrapper_payload = shell_wrapper_payload(tokens)
+        if wrapper_payload is None:
+            continue
+        if re.fullmatch(r"\s*\$\(\s*(?:curl|wget)\b[\s\S]*\)\s*", wrapper_payload):
+            return True
+        if re.fullmatch(r"\s*`\s*(?:curl|wget)\b[\s\S]*`\s*", wrapper_payload):
+            return True
+        if command_contains_remote_fetch_substitution(wrapper_payload):
+            return True
+    return False
+
+
+def pipeline_contains_remote_script_execution(command: str) -> bool:
+    pipeline_tokens: list[list[str]] = []
+
+    for raw, separator in split_shell_segments(command):
+        try:
+            tokens = shlex.split(raw)
+        except ValueError:
+            pipeline_tokens = []
+            continue
+        if not tokens:
+            if separator != PIPE_SEPARATOR:
+                pipeline_tokens = []
+            continue
+        wrapper_payload = shell_wrapper_payload(tokens)
+        if wrapper_payload is not None and pipeline_contains_remote_script_execution(wrapper_payload):
+            return True
+        pipeline_tokens.append(tokens)
+        if separator != PIPE_SEPARATOR:
+            has_fetch = any(tokens[0] in REMOTE_FETCH_COMMANDS for tokens in pipeline_tokens)
+            has_shell_executor = any(
+                tokens[0] in SHELL_WRAPPER_COMMANDS and shell_wrapper_payload(tokens) is None
+                for tokens in pipeline_tokens
+            )
+            if has_fetch and has_shell_executor:
+                return True
+            pipeline_tokens = []
+    return False
 
 
 def normalize_comparison_version(version: str) -> tuple[int, int, int]:
@@ -2766,7 +3177,7 @@ def evaluate_recommendation_candidate(
     candidate_version: str,
     plugin_root: Path,
     workspace: Path,
-) -> dict[str, Any]:
+) -> VetResult:
     package_name = dependency.name if dependency.ecosystem == "npm" else dependency.name.split("[", 1)[0]
     return vet_payload(
         {
@@ -2784,7 +3195,7 @@ def evaluate_recommendation_candidate(
     )
 
 
-def recommend_vetted_version(dependency: DependencyCommand, plugin_root: Path, workspace: Path) -> dict[str, Any]:
+def recommend_vetted_version(dependency: DependencyCommand, plugin_root: Path, workspace: Path) -> dict[str, str | None]:
     baseline_version: str | None = None
     baseline_source: str | None = None
     recommended_version: str | None = None
@@ -2879,34 +3290,94 @@ def build_recommended_command(
     return "".join(pieces).strip()
 
 
-def assess_dependency_command(command: str, plugin_root: Path, workspace: Path) -> dict[str, Any]:
+def synthetic_vet_result(
+    *,
+    summary: str,
+    recommended_version: str | None = None,
+    recommended_command: str | None = None,
+    baseline_version: str | None = None,
+    baseline_source: str | None = None,
+    next_action: str | None = None,
+) -> VetResult:
+    return {
+        "verdict": "warn",
+        "summary": summary,
+        "findings": [],
+        "checked_at": iso_now(),
+        "stamp_path": None,
+        "recommended_version": recommended_version,
+        "recommended_command": recommended_command,
+        "baseline_version": baseline_version,
+        "baseline_source": baseline_source,
+        "next_action": next_action,
+        "intel_selected_from": None,
+        "verification_status": "complete",
+        "manual_review_required": False,
+    }
+
+
+def assess_dependency_command(command: str, plugin_root: Path, workspace: Path) -> DependencyAssessment:
     segments = extract_dependency_segments(command)
     dependencies = [dependency for segment in segments for dependency in segment.dependencies]
     if not dependencies:
-        return {"matched": False, "block": False, "message": None, "results": [], "expected_mutations": []}
+        if pipeline_contains_remote_script_execution(command) or command_contains_remote_fetch_substitution(command):
+            return {
+                "matched": True,
+                "block": True,
+                "message": (
+                    "Pounce blocked shell execution fed by a remote fetch path. "
+                    "Run a vetted exact dependency command directly instead of piping or command-substituting shell code."
+                ),
+                "results": [],
+                "expected_mutations": [],
+                "recommended_command": None,
+                "next_action": "manual_review",
+            }
+        return {
+            "matched": False,
+            "block": False,
+            "message": None,
+            "results": [],
+            "expected_mutations": [],
+            "recommended_command": None,
+            "next_action": None,
+        }
 
     warnings: list[str] = []
     blocks: list[str] = []
-    results: list[dict[str, Any]] = []
-    expected_mutations: list[dict[str, Any]] = []
+    results: list[VetResult] = []
+    expected_mutations: list[DependencyMutation] = []
     recommended_rewrites: dict[tuple[int, int], str] = {}
     non_exact_result_indexes: list[int] = []
 
     for dependency in dependencies:
+        if dependency.piped:
+            summary = (
+                f"Pounce blocked `{dependency.original}` because dependency commands that participate in a pipe "
+                "cannot be verified safely."
+            )
+            results.append(synthetic_vet_result(summary=summary, next_action="manual_review"))
+            blocks.append(summary)
+            continue
+        if dependency.non_registry:
+            source_detail = dependency.source_detail or "non-registry source"
+            summary = (
+                f"Pounce blocked non-registry dependency source `{dependency.original}` ({source_detail}). "
+                "Use a vetted exact registry release instead."
+            )
+            results.append(synthetic_vet_result(summary=summary, next_action="manual_review"))
+            blocks.append(summary)
+            continue
         if not dependency.exact:
             recommendation = recommend_vetted_version(dependency, plugin_root, workspace)
-            result = {
-                "verdict": "warn",
-                "summary": f"Pounce blocked non-exact dependency spec `{dependency.original}`.",
-                "findings": [],
-                "checked_at": iso_now(),
-                "stamp_path": None,
-                "recommended_version": recommendation["recommended_version"],
-                "recommended_command": None,
-                "baseline_version": recommendation["baseline_version"],
-                "baseline_source": recommendation["baseline_source"],
-                "next_action": recommendation["next_action"],
-            }
+            result = synthetic_vet_result(
+                summary=f"Pounce blocked non-exact dependency spec `{dependency.original}`.",
+                recommended_version=recommendation["recommended_version"],
+                recommended_command=None,
+                baseline_version=recommendation["baseline_version"],
+                baseline_source=recommendation["baseline_source"],
+                next_action=recommendation["next_action"],
+            )
             results.append(result)
             non_exact_result_indexes.append(len(results) - 1)
             if recommendation["recommended_version"]:
@@ -2938,7 +3409,7 @@ def assess_dependency_command(command: str, plugin_root: Path, workspace: Path) 
             continue
         if result["verdict"] == "warn":
             warnings.append(result["summary"])
-        if dependency.version:
+        if dependency.version and dependency.allowlist_mutation:
             expected_mutations.append(
                 {
                     "ecosystem": dependency.ecosystem,
@@ -3102,16 +3573,21 @@ def render_workspace_hooks(installed_plugin_root: Path, existing_payload: dict[s
     }
 
 
-def ensure_workspace_config_toml(config_path: Path) -> None:
-    content = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+def render_workspace_config_toml(existing_content: str) -> str:
+    content = existing_content
     if "[features]" not in content:
         content = content.rstrip() + ("\n\n" if content.strip() else "") + "[features]\n"
     if re.search(r"(?m)^codex_hooks\s*=", content):
         content = re.sub(r"(?m)^codex_hooks\s*=.*$", "codex_hooks = true", content)
     else:
         content = re.sub(r"(?m)^\[features\]\s*$", "[features]\ncodex_hooks = true", content, count=1)
+    return content.rstrip() + "\n"
+
+
+def ensure_workspace_config_toml(config_path: Path) -> None:
+    content = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(content.rstrip() + "\n", encoding="utf-8")
+    config_path.write_text(render_workspace_config_toml(content), encoding="utf-8")
 
 
 def isoformat_utc(value: datetime | None) -> str | None:

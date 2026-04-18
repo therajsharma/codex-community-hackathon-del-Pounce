@@ -1,55 +1,140 @@
 {
+  "schema_version": "1.0",
+  "generated_at": "2026-04-18T00:00:00Z",
   "items": [
     {
       "id": "ioc-2026-031",
-      "severity": "critical",
-      "reason": "Known malicious dependency from the Axios supply-chain compromise disclosed on March 31, 2026.",
+      "kind": "malicious_package",
       "match": {
-        "type": "package",
+        "type": "package_exact",
         "ecosystem": "npm",
         "name": "plain-crypto-js",
         "version": "4.2.1"
-      }
+      },
+      "action": "block",
+      "confidence": 1.0,
+      "reason": "Known malicious dependency from the Axios supply-chain compromise disclosed on March 31, 2026.",
+      "source": "osv",
+      "source_refs": [
+        {"kind": "osv", "id": "MAL-2026-2306"},
+        {"kind": "ghsa", "id": "GHSA-2x9r-6wxq-hrr7"},
+        {"kind": "url", "url": "https://osv.dev/vulnerability/MAL-2026-2306"}
+      ],
+      "published_at": "2026-03-31T02:07:58Z",
+      "modified_at": "2026-03-31T05:33:43.274496Z",
+      "first_seen": "2026-03-31T02:07:58Z",
+      "last_seen": "2026-03-31T05:33:43.274496Z"
     },
     {
       "id": "ioc-2026-032",
-      "severity": "critical",
-      "reason": "Known network IOC from the Axios supply-chain compromise disclosed on March 31, 2026.",
+      "kind": "ioc_domain",
       "match": {
-        "type": "string",
+        "type": "domain",
         "value": "sfrclak.com"
-      }
+      },
+      "action": "block",
+      "confidence": 0.95,
+      "reason": "Known command-and-control domain from the Axios supply-chain compromise disclosed on March 31, 2026.",
+      "source": "osv",
+      "source_refs": [
+        {"kind": "osv", "id": "MAL-2026-2306"},
+        {"kind": "ghsa", "id": "GHSA-2x9r-6wxq-hrr7"},
+        {"kind": "url", "url": "https://osv.dev/vulnerability/MAL-2026-2306"}
+      ],
+      "published_at": "2026-03-31T02:07:58Z",
+      "modified_at": "2026-03-31T05:33:43.274496Z",
+      "first_seen": "2026-03-31T02:07:58Z",
+      "last_seen": "2026-03-31T05:33:43.274496Z"
     },
     {
       "id": "ioc-2026-033",
-      "severity": "critical",
-      "reason": "Known compromised LiteLLM release from the March 2026 PyPI incident.",
+      "kind": "malicious_package",
       "match": {
-        "type": "package",
+        "type": "package_exact",
         "ecosystem": "pypi",
         "name": "litellm",
         "version": "1.82.7"
-      }
+      },
+      "action": "block",
+      "confidence": 1.0,
+      "reason": "Known compromised LiteLLM release from the March 2026 PyPI credential-harvesting malware incident.",
+      "source": "osv",
+      "source_refs": [
+        {"kind": "osv", "id": "PYSEC-2026-2"},
+        {"kind": "osv", "id": "MAL-2026-2144"},
+        {"kind": "url", "url": "https://osv.dev/vulnerability/PYSEC-2026-2"}
+      ],
+      "published_at": "2026-03-24T16:15:08.809028Z",
+      "modified_at": "2026-03-25T16:45:07.164747Z",
+      "first_seen": "2026-03-24T16:15:08.809028Z",
+      "last_seen": "2026-03-25T16:45:07.164747Z"
     },
     {
       "id": "ioc-2026-034",
-      "severity": "critical",
-      "reason": "Known compromised LiteLLM release from the March 2026 PyPI incident.",
+      "kind": "malicious_package",
       "match": {
-        "type": "package",
+        "type": "package_exact",
         "ecosystem": "pypi",
         "name": "litellm",
         "version": "1.82.8"
-      }
+      },
+      "action": "block",
+      "confidence": 1.0,
+      "reason": "Known compromised LiteLLM release from the March 2026 PyPI credential-harvesting malware incident.",
+      "source": "osv",
+      "source_refs": [
+        {"kind": "osv", "id": "PYSEC-2026-2"},
+        {"kind": "osv", "id": "MAL-2026-2144"},
+        {"kind": "url", "url": "https://osv.dev/vulnerability/PYSEC-2026-2"}
+      ],
+      "published_at": "2026-03-24T16:15:08.809028Z",
+      "modified_at": "2026-03-25T16:45:07.164747Z",
+      "first_seen": "2026-03-24T16:15:08.809028Z",
+      "last_seen": "2026-03-25T16:45:07.164747Z"
     },
     {
       "id": "ioc-2026-035",
-      "severity": "critical",
-      "reason": "Known LiteLLM persistence artifact from the March 2026 PyPI incident.",
+      "kind": "ioc_string",
       "match": {
         "type": "string",
         "value": "litellm_init.pth"
-      }
+      },
+      "action": "block",
+      "confidence": 0.9,
+      "reason": "Known LiteLLM persistence artifact from the March 2026 PyPI credential-harvesting malware incident.",
+      "source": "osv",
+      "source_refs": [
+        {"kind": "osv", "id": "PYSEC-2026-2"},
+        {"kind": "osv", "id": "MAL-2026-2144"},
+        {"kind": "url", "url": "https://osv.dev/vulnerability/PYSEC-2026-2"}
+      ],
+      "published_at": "2026-03-24T16:15:08.809028Z",
+      "modified_at": "2026-03-25T16:45:07.164747Z",
+      "first_seen": "2026-03-24T16:15:08.809028Z",
+      "last_seen": "2026-03-25T16:45:07.164747Z"
+    },
+    {
+      "id": "ioc-2026-036",
+      "kind": "vulnerability",
+      "match": {
+        "type": "package_range",
+        "ecosystem": "npm",
+        "name": "@lightdash/cli",
+        "version_spec": ">=0.1800.0, <0.2695.1"
+      },
+      "action": "warn",
+      "confidence": 0.8,
+      "reason": "Fresh installs of affected @lightdash/cli versions during the March 31, 2026 window could resolve to compromised axios releases.",
+      "source": "github_advisory",
+      "source_refs": [
+        {"kind": "ghsa", "id": "GHSA-3hfp-gqgh-xc5g"},
+        {"kind": "url", "url": "https://github.com/advisories/GHSA-3hfp-gqgh-xc5g"},
+        {"kind": "url", "url": "https://osv.dev/vulnerability/GHSA-3hfp-gqgh-xc5g"}
+      ],
+      "published_at": "2026-04-02T18:36:10Z",
+      "modified_at": "2026-04-02T18:53:28.873335Z",
+      "first_seen": "2026-04-02T18:36:10Z",
+      "last_seen": "2026-04-02T18:53:28.873335Z"
     }
   ]
 }

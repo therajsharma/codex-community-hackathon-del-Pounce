@@ -94,7 +94,10 @@ def run_workspace_sweep_smoke() -> dict[str, Any]:
         return make_check(
             "workspace sweep catches bundled IOC indicators",
             result["verdict"] == "block"
-            and any(finding["signal_name"] == "artifact_ioc_match" for finding in result["findings"]),
+            and any(
+                finding["signal_name"] in {"artifact_ioc_match", "artifact_domain_match"}
+                for finding in result["findings"]
+            ),
             result["summary"],
         )
 
@@ -333,7 +336,7 @@ def print_human(payload: dict[str, Any]) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the deterministic Pounce hackathon smoke demo.")
+    parser = argparse.ArgumentParser(description="Run the deterministic Pounce smoke demo.")
     parser.add_argument("--json", action="store_true", help="Print the result as JSON.")
     return parser.parse_args()
 
