@@ -1,7 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 180" role="img" aria-label="Pounce mark">
-  <rect width="320" height="180" rx="12" fill="#000000"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 90" role="img" aria-label="Pounce mark">
   <g fill="none" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M110 118 145 48l24 34 36-36" stroke="#F97316" stroke-width="18"/>
-    <circle cx="226" cy="46" r="15" fill="#FDBA74" stroke="none"/>
+    <path d="M16 72 46 16l20 28 30-30" stroke="#F97316" stroke-width="15"/>
+    <circle cx="98" cy="14" r="10" fill="#FDBA74" stroke="none"/>
   </g>
 </svg>

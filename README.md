@@ -1,8 +1,4 @@
-<p>
-  <img src="plugins/pounce/assets/pounce-mark.svg" alt="Pounce logo" width="220" />
-</p>
-
-# Pounce
+<h1><img src="plugins/pounce/assets/pounce-mark.svg" alt="Pounce logo" width="36" /> Pounce</h1>
 
 [![Tests](https://github.com/therajsharma/Project-Zero/actions/workflows/test.yml/badge.svg)](https://github.com/therajsharma/Project-Zero/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
