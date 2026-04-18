@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest import mock
 
@@ -178,7 +179,7 @@ class PounceIntelTests(unittest.TestCase):
             pounce_intel.persist_feed_cache(
                 cached_feed,
                 fetched_at="2026-04-01T01:00:00Z",
-                fetched_from="https://feed.example/intel.json",
+                fetched_from="local_sync",
             )
             with mock.patch(
                 "pounce_intel.load_remote_feed",
@@ -187,9 +188,158 @@ class PounceIntelTests(unittest.TestCase):
                 context = pounce_intel.runtime_feed(PLUGIN_ROOT, "https://feed.example/intel.json")
 
         warning_details = " ".join(item["detail"] for item in context["warnings"])
-        self.assertIn("last good cached feed", warning_details)
+        self.assertIn("trusted local synced feed", warning_details)
         self.assertIn("stale", warning_details)
+        self.assertEqual(context["selected_from"], "local_sync_cache")
         self.assertTrue(any(item["id"] == "cached-1" for item in context["feed"]["items"]))
+
+    def test_runtime_feed_warns_on_old_hosted_feed_even_when_fetch_is_fresh(self) -> None:
+        remote_feed = {
+            "schema_version": "1.0",
+            "generated_at": "2026-04-01T00:00:00Z",
+            "sources": [{"name": "remote"}],
+            "items": [
+                self._item(
+                    "remote-1",
+                    {"type": "package_exact", "ecosystem": "npm", "name": "remote-demo", "version": "1.0.0"},
+                )
+            ],
+        }
+        fixed_now = datetime(2026, 4, 18, 12, 0, 0, tzinfo=UTC)
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(
+            os.environ,
+            {"POUNCE_STATE_DIR": tmpdir, "POUNCE_FEED_STALE_AFTER_HOURS": "6"},
+            clear=False,
+        ), mock.patch("pounce_intel.now_utc", return_value=fixed_now), mock.patch(
+            "pounce_intel.load_remote_feed",
+            return_value=remote_feed,
+        ):
+            context = pounce_intel.runtime_feed(PLUGIN_ROOT, "https://feed.example/intel.json")
+
+        self.assertEqual(context["selected_from"], "remote")
+        self.assertTrue(any(item["code"] == "feed_stale" for item in context["warnings"]))
+
+    def test_remote_cache_does_not_pollute_sync_or_export(self) -> None:
+        local_feed = {
+            "schema_version": "1.0",
+            "generated_at": "2026-04-10T00:00:00Z",
+            "sources": [{"name": "osv"}],
+            "items": [
+                self._item(
+                    "local-1",
+                    {"type": "package_exact", "ecosystem": "npm", "name": "local-demo", "version": "1.0.0"},
+                )
+            ],
+        }
+        remote_feed = {
+            "schema_version": "1.0",
+            "generated_at": "2026-04-11T00:00:00Z",
+            "sources": [{"name": "remote"}],
+            "items": [
+                self._item(
+                    "remote-1",
+                    {"type": "package_exact", "ecosystem": "npm", "name": "remote-demo", "version": "1.0.0"},
+                )
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(os.environ, {"POUNCE_STATE_DIR": tmpdir}, clear=False):
+            pounce_intel.persist_feed_cache(local_feed, fetched_at="2026-04-10T01:00:00Z", fetched_from="local_sync")
+            pounce_intel.persist_feed_cache(
+                remote_feed,
+                fetched_at="2026-04-11T01:00:00Z",
+                fetched_from="https://feed.example/intel.json",
+                path=pounce_intel.remote_feed_cache_path(),
+            )
+            exported = pounce_intel.export_intelligence_feed()
+            with mock.patch("pounce_intel.github_malware_items_since", return_value=([], {"name": "github_advisory"})), mock.patch(
+                "pounce_intel.osv_malware_items_since",
+                return_value=([], {"name": "osv"}),
+            ):
+                synced = pounce_intel.sync_public_intelligence()
+
+        self.assertEqual([item["id"] for item in exported["items"]], ["local-1"])
+        self.assertEqual([item["id"] for item in synced["items"]], ["local-1"])
+
+    def test_runtime_feed_precedence_prefers_remote_then_remote_cache_then_local_then_seed(self) -> None:
+        local_feed = {
+            "schema_version": "1.0",
+            "generated_at": "2026-04-10T00:00:00Z",
+            "sources": [{"name": "osv"}],
+            "items": [
+                self._item(
+                    "local-1",
+                    {"type": "package_exact", "ecosystem": "npm", "name": "local-demo", "version": "1.0.0"},
+                )
+            ],
+        }
+        remote_cache_feed = {
+            "schema_version": "1.0",
+            "generated_at": "2026-04-11T00:00:00Z",
+            "sources": [{"name": "remote"}],
+            "items": [
+                self._item(
+                    "remote-cache-1",
+                    {"type": "package_exact", "ecosystem": "npm", "name": "remote-cache-demo", "version": "1.0.0"},
+                )
+            ],
+        }
+        remote_live_feed = {
+            "schema_version": "1.0",
+            "generated_at": "2026-04-12T00:00:00Z",
+            "sources": [{"name": "remote"}],
+            "items": [
+                self._item(
+                    "remote-live-1",
+                    {"type": "package_exact", "ecosystem": "npm", "name": "remote-live-demo", "version": "1.0.0"},
+                )
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch.dict(os.environ, {"POUNCE_STATE_DIR": tmpdir}, clear=False):
+            pounce_intel.persist_feed_cache(local_feed, fetched_at="2026-04-10T01:00:00Z", fetched_from="local_sync")
+            pounce_intel.persist_feed_cache(
+                remote_cache_feed,
+                fetched_at="2026-04-11T01:00:00Z",
+                fetched_from="https://feed.example/intel.json",
+                path=pounce_intel.remote_feed_cache_path(),
+            )
+
+            with mock.patch("pounce_intel.load_remote_feed", return_value=remote_live_feed):
+                remote_context = pounce_intel.runtime_feed(PLUGIN_ROOT, "https://feed.example/intel.json")
+
+            pounce_intel.persist_feed_cache(
+                remote_cache_feed,
+                fetched_at="2026-04-11T01:00:00Z",
+                fetched_from="https://feed.example/intel.json",
+                path=pounce_intel.remote_feed_cache_path(),
+            )
+            with mock.patch(
+                "pounce_intel.load_remote_feed",
+                side_effect=pounce_intel.IntelUnavailable("timeout"),
+            ):
+                remote_cache_context = pounce_intel.runtime_feed(PLUGIN_ROOT, "https://feed.example/intel.json")
+
+            pounce_intel.remote_feed_cache_path().unlink()
+            with mock.patch(
+                "pounce_intel.load_remote_feed",
+                side_effect=pounce_intel.IntelUnavailable("timeout"),
+            ):
+                local_context = pounce_intel.runtime_feed(PLUGIN_ROOT, "https://feed.example/intel.json")
+
+            pounce_intel.feed_cache_path().unlink()
+            with mock.patch(
+                "pounce_intel.load_remote_feed",
+                side_effect=pounce_intel.IntelUnavailable("timeout"),
+            ):
+                seed_context = pounce_intel.runtime_feed(PLUGIN_ROOT, "https://feed.example/intel.json")
+
+        self.assertEqual(remote_context["selected_from"], "remote")
+        self.assertTrue(any(item["id"] == "remote-live-1" for item in remote_context["feed"]["items"]))
+        self.assertEqual(remote_cache_context["selected_from"], "remote_cache")
+        self.assertTrue(any(item["id"] == "remote-cache-1" for item in remote_cache_context["feed"]["items"]))
+        self.assertEqual(local_context["selected_from"], "local_sync_cache")
+        self.assertTrue(any(item["id"] == "local-1" for item in local_context["feed"]["items"]))
+        self.assertEqual(seed_context["selected_from"], "seed")
+        self.assertTrue(any(item["id"] == "ioc-2026-031" for item in seed_context["feed"]["items"]))
 
     def test_on_demand_osv_items_normalize_malware_as_block_and_vulns_as_warn(self) -> None:
         malware = {

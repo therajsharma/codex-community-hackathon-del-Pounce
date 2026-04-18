@@ -2,12 +2,35 @@
 
 Pounce is a local Codex plugin for dependency vetting, onboarding sweeps, shell-time supply-chain guardrails, and near-real-time malicious-package intelligence.
 
+## Why it is demo-ready
+
+Pounce is built for the exact place where AI coding agents create supply-chain risk: dependency changes. The current project already supports:
+
+- exact release vetting for npm and PyPI
+- workspace sweeps for malicious package indicators
+- shell-time blocking of risky dependency install commands
+- managed workspace hooks and policy injection
+- refreshable threat-intelligence feeds with bundled fallback data
+
+For a hackathon presentation, the fastest path is:
+
+```bash
+python3 plugins/pounce/scripts/install_local.py --workspace "$(pwd)"
+python3 plugins/pounce/scripts/pounce_demo.py
+pytest -q
+```
+
+Presentation docs:
+
+- [`docs/tripwire-final-spec.md`](../../docs/tripwire-final-spec.md)
+- [`docs/hackathon-demo.md`](../../docs/hackathon-demo.md)
+
 ## Local install
 
 From the repository root:
 
 ```bash
-python3 plugins/pounce/scripts/install_local.py --workspace /Users/sysuser/Documents/codebase/security/proj-zero
+python3 plugins/pounce/scripts/install_local.py --workspace "$(pwd)"
 ```
 
 This does four things:

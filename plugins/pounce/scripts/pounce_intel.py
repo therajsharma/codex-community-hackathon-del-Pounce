@@ -94,6 +94,18 @@ def normalize_ecosystem(value: Any) -> str:
     return normalized
 
 
+def normalize_python_package_key(name: str) -> str:
+    base = name.split("[", 1)[0].strip().lower()
+    return re.sub(r"[-_.]+", "-", base)
+
+
+def normalize_package_name(ecosystem: str, name: str) -> str:
+    normalized_ecosystem = normalize_ecosystem(ecosystem)
+    if normalized_ecosystem == "pypi":
+        return normalize_python_package_key(name)
+    return name.strip().lower()
+
+
 def state_dir() -> Path:
     configured = str(os.getenv("POUNCE_STATE_DIR", "")).strip()
     if configured:
@@ -103,6 +115,10 @@ def state_dir() -> Path:
 
 def feed_cache_path() -> Path:
     return state_dir() / "feed.json"
+
+
+def remote_feed_cache_path() -> Path:
+    return state_dir() / "remote-feed.json"
 
 
 def sync_state_path() -> Path:
@@ -203,14 +219,20 @@ def feed_cache_envelope(feed: dict[str, Any], *, fetched_at: str, fetched_from: 
     }
 
 
-def load_cached_feed_envelope() -> dict[str, Any] | None:
-    payload = load_json_file(feed_cache_path(), default=None)
+def load_cached_feed_envelope(*, path: Path | None = None) -> dict[str, Any] | None:
+    payload = load_json_file(path or feed_cache_path(), default=None)
     return payload if isinstance(payload, dict) else None
 
 
-def persist_feed_cache(feed: dict[str, Any], *, fetched_at: str | None = None, fetched_from: str | None = None) -> None:
+def persist_feed_cache(
+    feed: dict[str, Any],
+    *,
+    fetched_at: str | None = None,
+    fetched_from: str | None = None,
+    path: Path | None = None,
+) -> None:
     write_json(
-        feed_cache_path(),
+        path or feed_cache_path(),
         feed_cache_envelope(feed, fetched_at=fetched_at or iso_now(), fetched_from=fetched_from),
     )
 
@@ -254,6 +276,8 @@ def normalize_match_payload(match: Any) -> dict[str, Any] | None:
         name = str(match.get("name", "")).strip()
         if not ecosystem or not name:
             return None
+        if ecosystem == "pypi":
+            name = normalize_python_package_key(name)
         normalized = {"type": raw_type, "ecosystem": ecosystem, "name": name}
         if raw_type == "package_exact":
             version = str(match.get("version", "")).strip()
@@ -606,9 +630,13 @@ def package_item_matches(item: dict[str, Any], *, ecosystem: str, package_name: 
     match = item.get("match") or {}
     if not isinstance(match, dict):
         return False
-    if normalize_ecosystem(match.get("ecosystem")) != normalize_ecosystem(ecosystem):
+    normalized_ecosystem = normalize_ecosystem(ecosystem)
+    if normalize_ecosystem(match.get("ecosystem")) != normalized_ecosystem:
         return False
-    if str(match.get("name", "")).strip().lower() != package_name.strip().lower():
+    if normalize_package_name(normalized_ecosystem, str(match.get("name", ""))) != normalize_package_name(
+        normalized_ecosystem,
+        package_name,
+    ):
         return False
     match_type = str(match.get("type", "")).strip()
     if match_type == "package_exact":
@@ -1131,17 +1159,46 @@ def persist_sync_state(payload: dict[str, Any]) -> None:
     write_json(sync_state_path(), payload)
 
 
-def current_cached_feed() -> dict[str, Any]:
-    cached = load_cached_feed_envelope() or {}
+def current_cached_feed(
+    *,
+    path: Path | None = None,
+    observed_at: str | None = None,
+    default_source: str = "cached_feed",
+) -> dict[str, Any]:
+    cached = load_cached_feed_envelope(path=path) or {}
     feed = cached.get("feed")
     if isinstance(feed, dict):
-        return normalize_feed_artifact(feed)
-    return normalize_feed_artifact({"items": []})
+        return normalize_feed_artifact(feed, observed_at=observed_at, default_source=default_source)
+    return normalize_feed_artifact({"items": []}, observed_at=observed_at, default_source=default_source)
+
+
+def current_remote_cached_feed(
+    *,
+    feed_url: str | None = None,
+    observed_at: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    envelope = load_cached_feed_envelope(path=remote_feed_cache_path()) or {}
+    fetched_from = str(envelope.get("fetched_from", "")).strip()
+    if feed_url and fetched_from and fetched_from != feed_url:
+        return normalize_feed_artifact({"items": []}, observed_at=observed_at, default_source="remote_cache"), {}
+    return (
+        current_cached_feed(path=remote_feed_cache_path(), observed_at=observed_at, default_source="remote_cache"),
+        envelope,
+    )
+
+
+def feed_staleness_reference(feed: dict[str, Any], envelope: dict[str, Any] | None) -> datetime | None:
+    generated_at = parse_timestamp(feed.get("generated_at")) if isinstance(feed, dict) else None
+    fetched_at = parse_timestamp((envelope or {}).get("fetched_at"))
+    candidates = [candidate for candidate in (generated_at, fetched_at) if candidate is not None]
+    if not candidates:
+        return None
+    return min(candidates)
 
 
 def sync_public_intelligence() -> dict[str, Any]:
     state = load_sync_state()
-    cached = current_cached_feed()
+    cached = current_cached_feed(path=feed_cache_path(), default_source="local_sync_cache")
     items_by_id = {str(item["id"]): item for item in cached.get("items", []) if isinstance(item, dict) and item.get("id")}
     sources: list[dict[str, Any]] = []
 
@@ -1163,7 +1220,7 @@ def sync_public_intelligence() -> dict[str, Any]:
         "sources": sources,
         "items": sorted(items_by_id.values(), key=lambda item: item["id"]),
     }
-    persist_feed_cache(feed, fetched_at=iso_now(), fetched_from="local_sync")
+    persist_feed_cache(feed, fetched_at=iso_now(), fetched_from="local_sync", path=feed_cache_path())
     persist_sync_state(
         {
             "updated_at": iso_now(),
@@ -1177,7 +1234,7 @@ def sync_public_intelligence() -> dict[str, Any]:
 
 
 def export_intelligence_feed(*, output_path: str | None = None) -> dict[str, Any]:
-    feed = current_cached_feed()
+    feed = current_cached_feed(path=feed_cache_path(), default_source="local_sync_cache")
     if output_path:
         write_json(Path(output_path).expanduser().resolve(), feed)
     return feed
@@ -1193,42 +1250,71 @@ def runtime_feed(plugin_root: Path, feed_url: str | None) -> dict[str, Any]:
     seed_payload = json.loads((plugin_root / "data" / "seed_iocs.json").read_text(encoding="utf-8"))
     seed_feed = normalize_feed_artifact(seed_payload, observed_at=observed_at, default_source="seed_ioc")
 
-    cached_envelope = load_cached_feed_envelope() or {}
-    cached_feed = normalize_feed_artifact(cached_envelope.get("feed", {"items": []}), observed_at=observed_at, default_source="cached_feed")
-    cache_timestamp = str(cached_envelope.get("fetched_at", "")).strip() or str(cached_feed.get("generated_at", "")).strip()
-    selected_feed = cached_feed
-    selected_from = "cache" if cached_feed.get("items") else "seed"
+    local_cached_envelope = load_cached_feed_envelope(path=feed_cache_path()) or {}
+    local_cached_feed = current_cached_feed(
+        path=feed_cache_path(),
+        observed_at=observed_at,
+        default_source="local_sync_cache",
+    )
+    remote_cached_feed, remote_cached_envelope = current_remote_cached_feed(
+        feed_url=feed_url,
+        observed_at=observed_at,
+    )
+    selected_feed = local_cached_feed if local_cached_feed.get("items") else seed_feed
+    selected_envelope = local_cached_envelope if local_cached_feed.get("items") else {}
+    selected_from = "local_sync_cache" if local_cached_feed.get("items") else "seed"
     warnings: list[dict[str, Any]] = []
 
     if feed_url:
         try:
             remote_feed = load_remote_feed(feed_url)
-            persist_feed_cache(remote_feed, fetched_at=iso_now(), fetched_from=feed_url)
-            cached_envelope = load_cached_feed_envelope() or {}
-            cached_feed = normalize_feed_artifact(cached_envelope.get("feed", remote_feed), observed_at=observed_at, default_source="live_feed")
-            cache_timestamp = str(cached_envelope.get("fetched_at", "")).strip() or iso_now()
-            selected_feed = cached_feed
+            remote_fetched_at = iso_now()
+            selected_feed = normalize_feed_artifact(remote_feed, observed_at=observed_at, default_source="live_feed")
+            selected_envelope = feed_cache_envelope(selected_feed, fetched_at=remote_fetched_at, fetched_from=feed_url)
+            persist_feed_cache(
+                selected_feed,
+                fetched_at=remote_fetched_at,
+                fetched_from=feed_url,
+                path=remote_feed_cache_path(),
+            )
             selected_from = "remote"
         except IntelUnavailable as exc:
-            if cached_feed.get("items"):
+            if remote_cached_feed.get("items"):
                 warnings.append(
                     {
                         "code": "feed_refresh_failed",
-                        "detail": f"Live feed refresh failed, continuing with the last good cached feed: {exc}",
+                        "detail": f"Live feed refresh failed, continuing with the last good hosted feed cache: {exc}",
+                        "selected_from": "remote_cache",
                     }
                 )
+                selected_feed = remote_cached_feed
+                selected_envelope = remote_cached_envelope
+                selected_from = "remote_cache"
+            elif local_cached_feed.get("items"):
+                warnings.append(
+                    {
+                        "code": "feed_refresh_failed",
+                        "detail": f"Live feed refresh failed, continuing with the trusted local synced feed: {exc}",
+                        "selected_from": "local_sync_cache",
+                    }
+                )
+                selected_feed = local_cached_feed
+                selected_envelope = local_cached_envelope
+                selected_from = "local_sync_cache"
             else:
                 warnings.append(
                     {
                         "code": "feed_refresh_failed",
-                        "detail": f"Live feed refresh failed and no cached feed was available: {exc}",
+                        "detail": f"Live feed refresh failed and no hosted or local cached feed was available: {exc}",
+                        "selected_from": "seed",
                     }
                 )
-                selected_feed = normalize_feed_artifact({"items": []}, observed_at=observed_at, default_source="live_feed")
+                selected_feed = seed_feed
+                selected_envelope = {}
                 selected_from = "seed"
 
-    stale_reference = parse_timestamp(cache_timestamp) or parse_timestamp(selected_feed.get("generated_at"))
-    if selected_from in {"cache", "remote"} and stale_reference is not None:
+    stale_reference = feed_staleness_reference(selected_feed, selected_envelope)
+    if selected_from in {"remote", "remote_cache", "local_sync_cache"} and stale_reference is not None:
         age_seconds = (now_utc() - stale_reference).total_seconds()
         stale_seconds = stale_after_hours() * 3600
         if age_seconds >= stale_seconds:
@@ -1236,10 +1322,8 @@ def runtime_feed(plugin_root: Path, feed_url: str | None) -> dict[str, Any]:
             warnings.append(
                 {
                     "code": "feed_stale",
-                    "detail": (
-                        f"Threat intelligence feed is stale ({hours} hours since the last good refresh). "
-                        "Pounce continued with the cached feed."
-                    ),
+                    "detail": f"Threat intelligence feed is stale ({hours} hours old based on feed freshness).",
+                    "selected_from": selected_from,
                 }
             )
 
@@ -1248,7 +1332,7 @@ def runtime_feed(plugin_root: Path, feed_url: str | None) -> dict[str, Any]:
         "feed": merged,
         "selected_from": selected_from,
         "warnings": warnings,
-        "cache_timestamp": cache_timestamp,
+        "cache_timestamp": str((selected_envelope or {}).get("fetched_at", "")).strip(),
     }
 
 

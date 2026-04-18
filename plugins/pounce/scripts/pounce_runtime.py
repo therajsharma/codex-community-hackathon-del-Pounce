@@ -424,7 +424,7 @@ def build_verification_unavailable(
     )
 
 
-def build_feed_warning(detail: str, artifact: str) -> dict[str, Any]:
+def build_feed_warning(detail: str, artifact: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
     return make_finding(
         signal_id="intel-feed-warning",
         signal_name="intel_feed_warning",
@@ -435,6 +435,7 @@ def build_feed_warning(detail: str, artifact: str) -> dict[str, Any]:
         source="intel_feed",
         artifact=artifact,
         count_toward_block=False,
+        metadata=metadata,
     )
 
 
@@ -1811,6 +1812,83 @@ def collect_npm_lock_versions(lock_payload: dict[str, Any]) -> list[tuple[str, s
     return matches
 
 
+def collect_poetry_lock_versions(text: str) -> list[tuple[str, str]]:
+    matches: list[tuple[str, str]] = []
+    payload = tomllib.loads(text)
+    packages = payload.get("package")
+    if not isinstance(packages, list):
+        return matches
+    for entry in packages:
+        if not isinstance(entry, dict):
+            continue
+        name = normalize_python_package_key(str(entry.get("name", "")).strip())
+        version = str(entry.get("version", "")).strip()
+        if name and version:
+            matches.append((name, version))
+    return matches
+
+
+def collect_pipfile_lock_versions(text: str) -> list[tuple[str, str]]:
+    matches: list[tuple[str, str]] = []
+    payload = json.loads(text)
+    if not isinstance(payload, dict):
+        return matches
+    for section_name in ("default", "develop"):
+        section = payload.get(section_name)
+        if not isinstance(section, dict):
+            continue
+        for name, entry in section.items():
+            version_spec = ""
+            if isinstance(entry, dict):
+                version_spec = str(entry.get("version", "")).strip()
+            elif isinstance(entry, str):
+                version_spec = entry.strip()
+            if not version_spec:
+                continue
+            _, exact_spec, spec_kind = parse_python_spec(f"{name}{version_spec}")
+            if spec_kind != "exact" or not exact_spec:
+                continue
+            matches.append((normalize_python_package_key(str(name)), exact_spec))
+    return matches
+
+
+def collect_uv_lock_versions(text: str) -> list[tuple[str, str]]:
+    matches: list[tuple[str, str]] = []
+    payload = tomllib.loads(text)
+    packages = payload.get("package")
+    if not isinstance(packages, list):
+        return matches
+    for entry in packages:
+        if not isinstance(entry, dict):
+            continue
+        name = normalize_python_package_key(str(entry.get("name", "")).strip())
+        version = str(entry.get("version", "")).strip()
+        if name and version:
+            matches.append((name, version))
+    return matches
+
+
+def collect_python_lock_versions(workspace: Path) -> list[tuple[str, str, str]]:
+    parsers = {
+        "poetry.lock": collect_poetry_lock_versions,
+        "Pipfile.lock": collect_pipfile_lock_versions,
+        "uv.lock": collect_uv_lock_versions,
+    }
+    matches: list[tuple[str, str, str]] = []
+    for filename, parser in parsers.items():
+        path = workspace / filename
+        if not path.exists():
+            continue
+        try:
+            parsed = parser(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, tomllib.TOMLDecodeError, UnicodeDecodeError):
+            continue
+        relative_path = str(path.relative_to(workspace))
+        for name, version in parsed:
+            matches.append((name, version, relative_path))
+    return matches
+
+
 def collect_workspace_exact_packages(workspace: Path) -> list[tuple[str, str, str, str]]:
     packages: list[tuple[str, str, str, str]] = []
     seen: set[tuple[str, str, str, str]] = set()
@@ -1829,7 +1907,7 @@ def collect_workspace_exact_packages(workspace: Path) -> list[tuple[str, str, st
                 normalized_name = name
             else:
                 _, exact_spec, spec_kind = parse_python_spec(f"{name}{spec}")
-                normalized_name = name.split("[", 1)[0]
+                normalized_name = normalize_python_package_key(name)
             if spec_kind != "exact" or not exact_spec:
                 continue
             item = (ecosystem, normalized_name, exact_spec, path)
@@ -1845,6 +1923,11 @@ def collect_workspace_exact_packages(workspace: Path) -> list[tuple[str, str, st
             if item not in seen:
                 seen.add(item)
                 packages.append(item)
+    for name, version, origin_path in collect_python_lock_versions(workspace):
+        item = ("pypi", name, version, origin_path)
+        if item not in seen:
+            seen.add(item)
+            packages.append(item)
     return packages
 
 
@@ -1954,6 +2037,11 @@ def vet_payload(payload: dict[str, Any], plugin_root: Path, *, write_stamp_enabl
 
     indicators = collect_iocs(plugin_root)
     intel_warnings = list(_LAST_INTEL_CONTEXT.get("warnings", [])) if isinstance(_LAST_INTEL_CONTEXT, dict) else []
+    intel_selected_from = (
+        str(_LAST_INTEL_CONTEXT.get("selected_from", "")).strip()
+        if isinstance(_LAST_INTEL_CONTEXT, dict)
+        else ""
+    ) or None
     findings: list[dict[str, Any]] = []
     recommended_version: str | None = None
     recommended_command: str | None = None
@@ -2048,7 +2136,16 @@ def vet_payload(payload: dict[str, Any], plugin_root: Path, *, write_stamp_enabl
 
     for warning in intel_warnings:
         if isinstance(warning, dict):
-            findings.append(build_feed_warning(str(warning.get("detail", "")).strip(), artifact or "intel-feed"))
+            findings.append(
+                build_feed_warning(
+                    str(warning.get("detail", "")).strip(),
+                    artifact or "intel-feed",
+                    metadata={
+                        "intel_warning_code": str(warning.get("code", "")).strip() or None,
+                        "intel_selected_from": str(warning.get("selected_from", "")).strip() or intel_selected_from,
+                    },
+                )
+            )
 
     if artifacts:
         findings.extend(match_artifact_iocs(indicators, artifacts))
@@ -2083,6 +2180,7 @@ def vet_payload(payload: dict[str, Any], plugin_root: Path, *, write_stamp_enabl
             "baseline_version": baseline_version,
             "baseline_source": baseline_source,
             "next_action": next_action,
+            "intel_selected_from": intel_selected_from,
         }
         slug_source = artifact or workspace.name
         stamp_path = write_stamp(build_stamp_path(workspace, mode, slug_source), stamp_payload)
@@ -2098,6 +2196,7 @@ def vet_payload(payload: dict[str, Any], plugin_root: Path, *, write_stamp_enabl
         "baseline_version": baseline_version,
         "baseline_source": baseline_source,
         "next_action": next_action,
+        "intel_selected_from": intel_selected_from,
     }
 
 

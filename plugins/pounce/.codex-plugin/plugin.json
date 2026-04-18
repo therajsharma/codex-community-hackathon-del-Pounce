@@ -3,12 +3,12 @@
   "version": "0.1.0",
   "description": "Codex-native dependency vetting and supply-chain guardrails for AI-assisted coding.",
   "author": {
-    "name": "Local Security Plugin",
+    "name": "Raj Sharma",
     "email": "rajbuzzz2020@gmail.com",
-    "url": "/Users/sysuser/Documents/codebase/security/proj-zero"
+    "url": "https://github.com/therajsharma"
   },
-  "homepage": "/Users/sysuser/Documents/codebase/security/proj-zero/docs/tripwire-final-spec.md",
-  "repository": "/Users/sysuser/Documents/codebase/security/proj-zero",
+  "homepage": "https://github.com/therajsharma/Project-Zero",
+  "repository": "https://github.com/therajsharma/Project-Zero",
   "license": "MIT",
   "keywords": [
     "security",
@@ -22,19 +22,20 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Pounce",
-    "shortDescription": "Vet dependency releases before Codex writes or installs them",
-    "longDescription": "Pounce is a local Codex plugin for dependency vetting, onboarding sweeps, and shell-time install guardrails aimed at supply-chain incidents and risky fresh releases.",
-    "developerName": "Local Security Plugin",
+    "shortDescription": "Stop risky dependency installs before they land in a repo",
+    "longDescription": "Pounce turns dependency safety into an agent-native workflow for Codex with release vetting, workspace sweeps, and shell-time install guardrails.",
+    "developerName": "Raj Sharma",
     "category": "Coding",
     "capabilities": [
       "Interactive",
       "Read",
       "Write"
     ],
+    "websiteURL": "https://github.com/therajsharma/Project-Zero",
     "defaultPrompt": [
-      "Vet axios@1.14.1 before adding it to this project",
-      "Sweep this repo for IOC exposure from recent package compromises",
-      "Recommend the safest exact package version for this dependency"
+      "Vet plain-crypto-js@4.2.1 before adding it to this project",
+      "Sweep this repo for malicious package IOCs and install-time execution paths",
+      "Block risky Bash dependency installs and recommend an exact safer rewrite"
     ],
     "brandColor": "#C2410C",
     "composerIcon": "./assets/pounce-icon.svg",

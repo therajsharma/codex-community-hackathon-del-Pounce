@@ -437,6 +437,42 @@ class PounceRuntimeTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "block")
         self.assertTrue(any("incident.log" in finding["evidence"] for finding in result["findings"]))
 
+    def test_sweep_blocks_malicious_package_from_poetry_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            (workspace / "poetry.lock").write_text(
+                "[[package]]\nname = \"litellm\"\nversion = \"1.82.7\"\n",
+                encoding="utf-8",
+            )
+            result = vet_payload({"mode": "sweep", "workspace": str(workspace)}, PLUGIN_ROOT)
+        self.assertEqual(result["verdict"], "block")
+        finding = next(item for item in result["findings"] if item["signal_name"] == "exact_ioc_match")
+        self.assertIn("poetry.lock", finding["evidence"])
+
+    def test_sweep_blocks_malicious_package_from_pipfile_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            (workspace / "Pipfile.lock").write_text(
+                json.dumps({"default": {"litellm": {"version": "==1.82.8"}}, "develop": {}}),
+                encoding="utf-8",
+            )
+            result = vet_payload({"mode": "sweep", "workspace": str(workspace)}, PLUGIN_ROOT)
+        self.assertEqual(result["verdict"], "block")
+        finding = next(item for item in result["findings"] if item["signal_name"] == "exact_ioc_match")
+        self.assertIn("Pipfile.lock", finding["evidence"])
+
+    def test_sweep_blocks_malicious_package_from_uv_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            (workspace / "uv.lock").write_text(
+                "[[package]]\nname = \"litellm\"\nversion = \"1.82.7\"\n",
+                encoding="utf-8",
+            )
+            result = vet_payload({"mode": "sweep", "workspace": str(workspace)}, PLUGIN_ROOT)
+        self.assertEqual(result["verdict"], "block")
+        finding = next(item for item in result["findings"] if item["signal_name"] == "exact_ioc_match")
+        self.assertIn("uv.lock", finding["evidence"])
+
     def test_sweep_does_not_block_generic_python_subprocess_usage(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Path(tmpdir)
