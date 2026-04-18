@@ -14,10 +14,14 @@ if str(SCRIPTS_ROOT) not in sys.path:
 
 from pounce_runtime import (  # noqa: E402
     VerificationUnavailable,
+    assess_dependency_command,
+    assess_dependency_guard,
     agents_block_text,
     check_npm_release,
     extract_dependency_commands,
+    record_dependency_guard_allowlist,
     replace_managed_block,
+    snapshot_dependency_guard,
     vet_payload,
 )
 
@@ -73,6 +77,190 @@ class PounceRuntimeTests(unittest.TestCase):
         self.assertEqual(result[0].version, "1.14.1")
         self.assertEqual(result[1].name, "@scope/demo")
         self.assertEqual(result[1].version, "2.0.0")
+
+    def test_dependency_command_parser_handles_chained_and_multiline_commands(self) -> None:
+        command = (
+            "echo warmup && npm i axios@^1.14.0 @scope/demo@2.0.0\n"
+            "pnpm up react@18.x ; yarn up lodash@~4.17.0 && bun add zod@3.22.4 && "
+            "pip3 install requests[socks]>=2.31.0 && uv pip install rich==13.7.1 && "
+            "uv add httpx && poetry add click==8.1.7"
+        )
+        result = extract_dependency_commands(command)
+        self.assertEqual(
+            [(item.manager, item.verb, item.name, item.spec_kind) for item in result],
+            [
+                ("npm", "i", "axios", "range"),
+                ("npm", "i", "@scope/demo", "exact"),
+                ("pnpm", "up", "react", "range"),
+                ("yarn", "up", "lodash", "range"),
+                ("bun", "add", "zod", "exact"),
+                ("pip3", "install", "requests[socks]", "range"),
+                ("uv", "install", "rich", "exact"),
+                ("uv", "add", "httpx", "unpinned"),
+                ("poetry", "add", "click", "exact"),
+            ],
+        )
+        self.assertEqual(extract_dependency_commands("echo 'npm install demo'"), [])
+
+    def test_non_exact_npm_install_returns_rewrite_with_baseline(self) -> None:
+        package_index = {
+            "versions": {
+                "1.0.0": {"dist": {}, "dependencies": {}},
+                "1.2.0": {"dist": {}, "dependencies": {}},
+            },
+            "time": {
+                "1.0.0": "2026-01-01T00:00:00Z",
+                "1.2.0": "2026-02-01T00:00:00Z",
+            },
+            "dist-tags": {"latest": "1.2.0"},
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            (workspace / "package-lock.json").write_text(
+                json.dumps(
+                    {
+                        "name": "fixture",
+                        "lockfileVersion": 3,
+                        "packages": {
+                            "": {"name": "fixture", "version": "1.0.0"},
+                            "node_modules/demo": {"version": "1.0.0"},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch("pounce_runtime.collect_iocs", return_value=[]),
+                mock.patch("pounce_runtime.load_npm_package_index", return_value=package_index),
+                mock.patch("pounce_runtime.check_npm_release", return_value=[]),
+            ):
+                assessment = assess_dependency_command("npm i demo@^1.0.0", PLUGIN_ROOT, workspace)
+        self.assertTrue(assessment["matched"])
+        self.assertTrue(assessment["block"])
+        self.assertEqual(assessment["recommended_command"], "npm i demo@1.2.0 --save-exact")
+        self.assertEqual(assessment["next_action"], "rewrite_command")
+        self.assertEqual(assessment["results"][0]["recommended_version"], "1.2.0")
+        self.assertEqual(assessment["results"][0]["baseline_version"], "1.0.0")
+        self.assertEqual(assessment["results"][0]["baseline_source"], "workspace_lockfile")
+
+    def test_non_exact_pypi_install_returns_rewrite_with_workspace_baseline(self) -> None:
+        package_index = {
+            "releases": {
+                "1.0.0": [{"upload_time_iso_8601": "2026-01-01T00:00:00Z"}],
+                "1.5.0": [{"upload_time_iso_8601": "2026-02-01T00:00:00Z"}],
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            (workspace / "requirements.txt").write_text("demo==1.0.0\n", encoding="utf-8")
+            with (
+                mock.patch("pounce_runtime.collect_iocs", return_value=[]),
+                mock.patch("pounce_runtime.load_pypi_package_index", return_value=package_index),
+                mock.patch("pounce_runtime.check_pypi_release", return_value=[]),
+            ):
+                assessment = assess_dependency_command("pip3 install demo", PLUGIN_ROOT, workspace)
+        self.assertTrue(assessment["matched"])
+        self.assertTrue(assessment["block"])
+        self.assertEqual(assessment["recommended_command"], "pip3 install demo==1.5.0")
+        self.assertEqual(assessment["results"][0]["recommended_version"], "1.5.0")
+        self.assertEqual(assessment["results"][0]["baseline_version"], "1.0.0")
+        self.assertEqual(assessment["results"][0]["baseline_source"], "workspace_manifest")
+
+    def test_snapshot_dependency_guard_creates_turn_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            (workspace / "package.json").write_text(
+                json.dumps({"dependencies": {"demo": "1.0.0"}}),
+                encoding="utf-8",
+            )
+            state_path = Path(snapshot_dependency_guard(workspace, "turn-1"))
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertTrue(state_path.exists())
+            self.assertIn("package.json", payload["snapshot"]["files"])
+
+    def test_allowlist_recording_uses_vetted_install_mutations(self) -> None:
+        package_index = {
+            "versions": {"1.2.0": {"dist": {}, "dependencies": {}}},
+            "time": {"1.2.0": "2026-02-01T00:00:00Z"},
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            (workspace / "package.json").write_text(json.dumps({"dependencies": {}}), encoding="utf-8")
+            snapshot_dependency_guard(workspace, "turn-1")
+            with (
+                mock.patch("pounce_runtime.collect_iocs", return_value=[]),
+                mock.patch("pounce_runtime.load_npm_package_index", return_value=package_index),
+                mock.patch("pounce_runtime.check_npm_release", return_value=[]),
+            ):
+                assessment = assess_dependency_command("npm install demo@1.2.0", PLUGIN_ROOT, workspace)
+            state_path = Path(record_dependency_guard_allowlist(workspace, "turn-1", assessment["expected_mutations"]))
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertFalse(assessment["block"])
+        self.assertEqual(len(payload["allowlist"]), 1)
+        self.assertEqual(payload["allowlist"][0]["name"], "demo")
+        self.assertEqual(payload["allowlist"][0]["expected_version"], "1.2.0")
+
+    def test_guard_blocks_direct_unvetted_dependency_edits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            (workspace / "package.json").write_text(
+                json.dumps({"dependencies": {"demo": "1.0.0"}}),
+                encoding="utf-8",
+            )
+            snapshot_dependency_guard(workspace, "turn-1")
+            (workspace / "package.json").write_text(
+                json.dumps({"dependencies": {"demo": "1.0.0", "leftpad": "^1.3.0"}}),
+                encoding="utf-8",
+            )
+            assessment = assess_dependency_guard(workspace, "turn-1")
+        self.assertTrue(assessment["block"])
+        self.assertIn("leftpad", assessment["message"])
+
+    def test_guard_allows_vetted_same_turn_install_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            (workspace / "package.json").write_text(
+                json.dumps({"dependencies": {"demo": "1.0.0"}}),
+                encoding="utf-8",
+            )
+            (workspace / "package-lock.json").write_text(json.dumps({"packages": {}}), encoding="utf-8")
+            snapshot_dependency_guard(workspace, "turn-1")
+            record_dependency_guard_allowlist(
+                workspace,
+                "turn-1",
+                [
+                    {
+                        "ecosystem": "npm",
+                        "manager": "npm",
+                        "verb": "install",
+                        "name": "demo",
+                        "expected_version": "1.2.0",
+                        "command": "npm install demo@1.2.0 --save-exact",
+                    }
+                ],
+            )
+            (workspace / "package.json").write_text(
+                json.dumps({"dependencies": {"demo": "1.2.0"}}),
+                encoding="utf-8",
+            )
+            (workspace / "package-lock.json").write_text(json.dumps({"packages": {"node_modules/demo": {"version": "1.2.0"}}}), encoding="utf-8")
+            assessment = assess_dependency_guard(workspace, "turn-1")
+        self.assertFalse(assessment["block"])
+
+    def test_guard_ignores_non_semantic_requirement_edits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            (workspace / "requirements.txt").write_text(
+                "demo==1.0.0\n# keep pinned\n",
+                encoding="utf-8",
+            )
+            snapshot_dependency_guard(workspace, "turn-1")
+            (workspace / "requirements.txt").write_text(
+                "\n demo==1.0.0  # still pinned\n",
+                encoding="utf-8",
+            )
+            assessment = assess_dependency_guard(workspace, "turn-1")
+        self.assertFalse(assessment["block"])
 
     def test_npm_provenance_regression_warns_only_when_baseline_had_attestations(self) -> None:
         package_index = {
@@ -173,6 +361,29 @@ class PounceRuntimeTests(unittest.TestCase):
             result = vet_payload({"mode": "sweep", "workspace": str(workspace)}, PLUGIN_ROOT)
         self.assertEqual(result["verdict"], "block")
         self.assertTrue(any("incident.log" in finding["evidence"] for finding in result["findings"]))
+
+    def test_sweep_does_not_block_generic_python_subprocess_usage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            (workspace / "cli.py").write_text(
+                "import subprocess\nsubprocess.Popen(['echo', 'hello'])\n",
+                encoding="utf-8",
+            )
+            result = vet_payload({"mode": "sweep", "workspace": str(workspace)}, PLUGIN_ROOT)
+        self.assertEqual(result["verdict"], "allow")
+        self.assertFalse(any(finding["signal_name"] == "mechanism_subprocess_popen" for finding in result["findings"]))
+        self.assertFalse(any(finding["signal_name"] == "artifact_ioc_match" for finding in result["findings"]))
+
+    def test_sweep_blocks_setup_py_subprocess_usage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            (workspace / "setup.py").write_text(
+                "import subprocess\nsubprocess.Popen(['echo', 'hello'])\n",
+                encoding="utf-8",
+            )
+            result = vet_payload({"mode": "sweep", "workspace": str(workspace)}, PLUGIN_ROOT)
+        self.assertEqual(result["verdict"], "block")
+        self.assertTrue(any(finding["signal_name"] == "mechanism_subprocess_popen" for finding in result["findings"]))
 
     def test_sweep_truncation_warns(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

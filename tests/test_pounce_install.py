@@ -70,6 +70,11 @@ class PounceInstallTests(unittest.TestCase):
         commands = [hook["command"] for hook in bash_entry["hooks"]]
         self.assertIn("echo existing", commands)
         self.assertEqual(sum("pounce_hook.py" in command for command in commands), 1)
+        for event_name in ("UserPromptSubmit", "Stop"):
+            self.assertIn(event_name, payload["hooks"])
+            self.assertEqual(len(payload["hooks"][event_name]), 1)
+            event_hooks = payload["hooks"][event_name][0]["hooks"]
+            self.assertEqual(sum("pounce_hook.py" in hook["command"] for hook in event_hooks), 1)
         self.assertIn("PostToolUse", payload["hooks"])
 
     def test_workspace_config_is_preserved_when_hooks_are_written(self) -> None:

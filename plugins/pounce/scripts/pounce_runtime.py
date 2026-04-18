@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import configparser
+import hashlib
 import json
 import os
 import re
@@ -15,6 +17,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
+import tomllib
 
 
 MANAGED_BLOCK_BEGIN = "<!-- BEGIN POUNCE MANAGED BLOCK -->"
@@ -24,6 +27,7 @@ MAX_SCAN_FILE_SIZE = 512 * 1024
 MAX_SCAN_FILE_COUNT = 1000
 MAX_NPM_GRAPH_NODES = 250
 POUNCE_HOOK_STATUS_MESSAGE = "Pounce vetting dependency command"
+GUARD_STATE_DIRNAME = "guard"
 
 TEXT_FILE_NAMES = {
     "package.json",
@@ -63,15 +67,85 @@ IGNORE_DIRECTORIES = {
     ".tox",
     "__pycache__",
 }
-DEPENDENCY_COMMAND_PREFIXES = {
-    ("npm", "install"): "npm",
-    ("npm", "add"): "npm",
-    ("pnpm", "add"): "npm",
-    ("yarn", "add"): "npm",
-    ("pip", "install"): "pypi",
-    ("uv", "add"): "pypi",
-    ("poetry", "add"): "pypi",
+LOCKFILE_NAMES = {
+    "Pipfile.lock",
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "pnpm-lock.yaml",
+    "poetry.lock",
+    "uv.lock",
+    "yarn.lock",
 }
+PACKAGE_JSON_DEPENDENCY_SECTIONS = (
+    "dependencies",
+    "devDependencies",
+    "optionalDependencies",
+    "peerDependencies",
+)
+COMMAND_PATTERNS = (
+    (("uv", "pip", "install"), "pypi", "uv", "install"),
+    (("npm", "install"), "npm", "npm", "install"),
+    (("npm", "i"), "npm", "npm", "i"),
+    (("npm", "add"), "npm", "npm", "add"),
+    (("pnpm", "add"), "npm", "pnpm", "add"),
+    (("pnpm", "up"), "npm", "pnpm", "up"),
+    (("yarn", "add"), "npm", "yarn", "add"),
+    (("yarn", "up"), "npm", "yarn", "up"),
+    (("bun", "add"), "npm", "bun", "add"),
+    (("pip", "install"), "pypi", "pip", "install"),
+    (("pip3", "install"), "pypi", "pip3", "install"),
+    (("uv", "add"), "pypi", "uv", "add"),
+    (("poetry", "add"), "pypi", "poetry", "add"),
+)
+COMMAND_FLAGS_WITH_VALUES = {
+    "npm": {"--tag", "--registry", "--workspace", "--prefix", "--userconfig", "-C", "-w"},
+    "pnpm": {"--filter", "--dir", "--workspace-root", "-C", "-F"},
+    "yarn": {"--cwd", "--mode", "--json"},
+    "bun": {"--cwd", "--registry", "--filter"},
+    "pip": {
+        "-c",
+        "--constraint",
+        "-e",
+        "--editable",
+        "-f",
+        "--find-links",
+        "-i",
+        "--index-url",
+        "-r",
+        "--requirement",
+        "--extra-index-url",
+        "--python",
+    },
+    "pip3": {
+        "-c",
+        "--constraint",
+        "-e",
+        "--editable",
+        "-f",
+        "--find-links",
+        "-i",
+        "--index-url",
+        "-r",
+        "--requirement",
+        "--extra-index-url",
+        "--python",
+    },
+    "uv": {"--group", "--extra", "-c", "--constraint", "-r", "--requirement", "--python"},
+    "poetry": {"--group", "-G", "--source"},
+}
+NPM_EXACT_SAVE_FLAGS = {
+    ("npm", "install"): "--save-exact",
+    ("npm", "i"): "--save-exact",
+    ("npm", "add"): "--save-exact",
+    ("pnpm", "add"): "--save-exact",
+    ("yarn", "add"): "--exact",
+    ("yarn", "up"): "--exact",
+    ("bun", "add"): "--exact",
+}
+NPM_EXACT_VERSION_RE = re.compile(r"^v?\d+(?:\.\d+){0,2}(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$")
+PYTHON_EXACT_SPEC_RE = re.compile(r"^(?:===|==)\s*[^,*;\s]+$")
+PYTHON_NAME_SPEC_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9_.-]*(?:\[[^\]]+\])?)(.*)$")
+VERSION_TOKEN_RE = re.compile(r"[A-Za-z]+|\d+")
 MECHANISM_PATTERNS = (
     (
         "mechanism_postinstall",
@@ -79,6 +153,7 @@ MECHANISM_PATTERNS = (
         "critical",
         "block",
         "npm install-time script matched `postinstall`.",
+        frozenset({"npm_install"}),
     ),
     (
         "mechanism_prepare",
@@ -86,6 +161,7 @@ MECHANISM_PATTERNS = (
         "medium",
         "warn",
         "npm install-time script matched `prepare`.",
+        frozenset({"npm_install"}),
     ),
     (
         "mechanism_pth_injection",
@@ -93,6 +169,7 @@ MECHANISM_PATTERNS = (
         "critical",
         "block",
         "Python persistence mechanism matched `.pth` injection.",
+        frozenset({"python_persistence"}),
     ),
     (
         "mechanism_subprocess_popen",
@@ -100,6 +177,7 @@ MECHANISM_PATTERNS = (
         "critical",
         "block",
         "Python install-time code matched `subprocess.Popen`.",
+        frozenset({"python_install"}),
     ),
 )
 
@@ -116,13 +194,22 @@ class VerificationUnavailable(Exception):
 @dataclass(slots=True)
 class DependencyCommand:
     ecosystem: str
+    manager: str
+    verb: str
     name: str
-    version: str | None
+    version_spec: str | None
     original: str
+    spec_kind: str
+    segment_index: int
+    token_index: int
 
     @property
     def exact(self) -> bool:
-        return bool(self.version)
+        return self.spec_kind == "exact"
+
+    @property
+    def version(self) -> str | None:
+        return self.version_spec if self.exact else None
 
     @property
     def artifact(self) -> str:
@@ -130,6 +217,19 @@ class DependencyCommand:
             separator = "==" if self.ecosystem == "pypi" else "@"
             return f"{self.name}{separator}{self.version}"
         return self.name
+
+
+@dataclass(slots=True)
+class DependencyCommandSegment:
+    raw: str
+    separator: str | None
+    tokens: list[str]
+    prefix_length: int
+    ecosystem: str
+    manager: str
+    verb: str
+    index: int
+    dependencies: list[DependencyCommand]
 
 
 def plugin_root_from_script(script_file: str | Path) -> Path:
@@ -415,9 +515,17 @@ def match_artifact_iocs(items: list[dict[str, Any]], artifacts: list[str]) -> li
     return findings
 
 
-def scan_mechanisms(text: str, *, source: str, artifact: str) -> list[dict[str, Any]]:
+def scan_mechanisms(
+    text: str,
+    *,
+    source: str,
+    artifact: str,
+    contexts: set[str] | None = None,
+) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
-    for signal_name, pattern, severity, verdict_impact, evidence in MECHANISM_PATTERNS:
+    for signal_name, pattern, severity, verdict_impact, evidence, pattern_contexts in MECHANISM_PATTERNS:
+        if contexts is not None and not pattern_contexts.intersection(contexts):
+            continue
         if not pattern.search(text):
             continue
         findings.append(
@@ -650,6 +758,131 @@ def resolve_npm_release_baseline(
     return None, None
 
 
+def workspace_dependency_versions(workspace: Path | None, ecosystem: str, package_name: str) -> list[str]:
+    if workspace is None or not workspace.exists():
+        return []
+    snapshot = collect_dependency_snapshot(workspace)
+    package_key = package_name if ecosystem == "npm" else normalize_python_package_key(package_name)
+    matches: list[str] = []
+    for entry in (snapshot.get("files") or {}).values():
+        if not isinstance(entry, dict) or entry.get("ecosystem") != ecosystem or entry.get("lockfile"):
+            continue
+        dependencies = entry.get("dependencies") or {}
+        for key, spec in dependencies.items():
+            if ecosystem == "npm":
+                candidate_name = dependency_entry_name(str(key))
+            else:
+                candidate_name = normalize_python_package_key(dependency_entry_name(str(key)))
+            if candidate_name != package_key:
+                continue
+            spec_value = str(spec or "").strip()
+            if ecosystem == "npm":
+                _, exact_spec, spec_kind = parse_npm_spec(f"{dependency_entry_name(str(key))}@{spec_value}")
+            else:
+                _, exact_spec, spec_kind = parse_python_spec(f"{dependency_entry_name(str(key))}{spec_value}")
+            if spec_kind == "exact" and exact_spec:
+                matches.append(exact_spec)
+    return matches
+
+
+def resolve_workspace_python_version(workspace: Path | None, package_name: str) -> str | None:
+    matches = workspace_dependency_versions(workspace, "pypi", package_name)
+    return matches[0] if matches else None
+
+
+def resolve_stamp_python_version(workspace: Path | None, package_name: str, target_version: str) -> str | None:
+    if workspace is None:
+        return None
+    stamp_dir = workspace / ".pounce" / "stamps"
+    if not stamp_dir.exists():
+        return None
+
+    normalized_package_name = normalize_python_package_key(package_name)
+    best_version: str | None = None
+    best_checked_at: datetime | None = None
+    for stamp_path in stamp_dir.glob("release-*.json"):
+        try:
+            payload = load_json(stamp_path)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict) or payload.get("verdict") == "block":
+            continue
+        request = payload.get("request", {})
+        if not isinstance(request, dict):
+            continue
+        if normalize_ecosystem(request.get("ecosystem")) != "pypi":
+            continue
+        if normalize_python_package_key(str(request.get("package_name", ""))) != normalized_package_name:
+            continue
+        version = str(request.get("version", "")).strip()
+        if not version or version == target_version:
+            continue
+        checked_at = parse_timestamp(payload.get("checked_at"))
+        if checked_at is None:
+            checked_at = datetime.fromtimestamp(stamp_path.stat().st_mtime, tz=UTC)
+        if best_checked_at is None or checked_at > best_checked_at:
+            best_version = version
+            best_checked_at = checked_at
+    return best_version
+
+
+def pypi_release_uploaded_at(releases: dict[str, Any], version: str) -> datetime | None:
+    release_entries = releases.get(version)
+    if not isinstance(release_entries, list) or not release_entries:
+        return None
+    timestamps = [
+        parse_timestamp(entry.get("upload_time_iso_8601"))
+        for entry in release_entries
+        if isinstance(entry, dict)
+    ]
+    timestamps = [timestamp for timestamp in timestamps if timestamp is not None]
+    if not timestamps:
+        return None
+    return min(timestamps)
+
+
+def select_previous_pypi_version(package_index: dict[str, Any], version: str) -> str | None:
+    releases = package_index.get("releases", {})
+    if not isinstance(releases, dict):
+        return None
+    target_time = pypi_release_uploaded_at(releases, version)
+    if not target_time:
+        return None
+
+    previous_version: str | None = None
+    previous_time: datetime | None = None
+    for candidate in releases:
+        if candidate == version:
+            continue
+        published_at = pypi_release_uploaded_at(releases, candidate)
+        if not published_at or published_at >= target_time:
+            continue
+        if previous_time is None or published_at > previous_time:
+            previous_version = candidate
+            previous_time = published_at
+    return previous_version
+
+
+def resolve_pypi_release_baseline(
+    package_index: dict[str, Any],
+    package_name: str,
+    version: str,
+    workspace: Path | None,
+) -> tuple[str | None, str | None]:
+    workspace_version = resolve_workspace_python_version(workspace, package_name)
+    if workspace_version:
+        return workspace_version, "workspace_manifest"
+
+    stamped_version = resolve_stamp_python_version(workspace, package_name, version)
+    if stamped_version:
+        return stamped_version, "last_good_stamp"
+
+    previous_version = select_previous_pypi_version(package_index, version)
+    if previous_version:
+        return previous_version, "registry_previous_release"
+    return None, None
+
+
 def metadata_dependencies(metadata: dict[str, Any]) -> dict[str, str]:
     dependencies = metadata.get("dependencies") or {}
     if not isinstance(dependencies, dict):
@@ -874,13 +1107,24 @@ def check_release_age(published_at: datetime | None, artifact: str) -> list[dict
     ]
 
 
+def load_npm_package_index(package_name: str) -> dict[str, Any]:
+    return fetch_json(
+        f"https://registry.npmjs.org/{quote(package_name, safe='@/')}",
+        cache_key=f"npm:{package_name}",
+    )
+
+
+def load_pypi_package_index(package_name: str) -> dict[str, Any]:
+    return fetch_json(
+        f"https://pypi.org/pypi/{quote(package_name)}/json",
+        cache_key=f"pypi-index:{normalize_python_package_key(package_name)}",
+    )
+
+
 def check_npm_release(package_name: str, version: str, workspace: Path | None = None) -> list[dict[str, Any]]:
     artifact = f"{package_name}@{version}"
     try:
-        package_index = fetch_json(
-            f"https://registry.npmjs.org/{quote(package_name, safe='@/')}",
-            cache_key=f"npm:{package_name}",
-        )
+        package_index = load_npm_package_index(package_name)
     except VerificationUnavailable as exc:
         return [build_verification_unavailable(source="registry", artifact=artifact, detail=str(exc))]
 
@@ -919,7 +1163,14 @@ def check_npm_release(package_name: str, version: str, workspace: Path | None = 
     scripts = metadata.get("scripts", {})
     if isinstance(scripts, dict):
         script_names = " ".join(str(key) for key in scripts.keys())
-        findings.extend(scan_mechanisms(script_names, source="registry", artifact=artifact))
+        findings.extend(
+            scan_mechanisms(
+                script_names,
+                source="registry",
+                artifact=artifact,
+                contexts={"npm_install"},
+            )
+        )
 
     findings.extend(
         check_npm_dependency_diff(
@@ -941,7 +1192,7 @@ def check_pypi_release(package_name: str, version: str) -> list[dict[str, Any]]:
     try:
         payload = fetch_json(
             f"https://pypi.org/pypi/{quote(package_name)}/{quote(version)}/json",
-            cache_key=f"pypi:{package_name}:{version}",
+            cache_key=f"pypi:{normalize_python_package_key(package_name)}:{version}",
         )
     except VerificationUnavailable as exc:
         return [build_verification_unavailable(source="registry", artifact=artifact, detail=str(exc))]
@@ -1001,6 +1252,481 @@ def write_stamp(path: Path, payload: dict[str, Any]) -> str:
     return str(path)
 
 
+def normalize_python_package_key(name: str) -> str:
+    base = name.split("[", 1)[0].strip().lower()
+    return re.sub(r"[-_.]+", "-", base)
+
+
+def safe_guard_turn_id(turn_id: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", turn_id).strip("-") or "active"
+
+
+def guard_state_path(workspace: Path, turn_id: str) -> Path:
+    return workspace / ".pounce" / GUARD_STATE_DIRNAME / f"turn-{safe_guard_turn_id(turn_id)}.json"
+
+
+def dependency_file_kind(path: Path) -> str | None:
+    name = path.name
+    if name == "package.json":
+        return "package_json"
+    if name in LOCKFILE_NAMES:
+        return "lockfile"
+    if name.startswith("requirements") and path.suffix.lower() == ".txt":
+        return "requirements"
+    if name == "pyproject.toml":
+        return "pyproject"
+    if name == "setup.cfg":
+        return "setup_cfg"
+    if name == "setup.py":
+        return "setup_py"
+    if name == "Pipfile":
+        return "pipfile"
+    return None
+
+
+def dependency_file_ecosystem(path: Path) -> str:
+    if path.name in {"package.json", "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock"}:
+        return "npm"
+    return "pypi"
+
+
+def is_dependency_guard_path(path: Path) -> bool:
+    return dependency_file_kind(path) is not None
+
+
+def hash_payload(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def normalize_dependency_text(text: str) -> str:
+    lines: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def dependency_entry_name(key: str) -> str:
+    return key.rsplit(":", 1)[-1]
+
+
+def parse_python_requirement_entry(spec: str) -> tuple[str, str]:
+    candidate = spec.strip()
+    if not candidate or candidate.startswith("-") or "://" in candidate:
+        return "", ""
+    candidate = candidate.split(";", 1)[0].strip()
+    match = PYTHON_NAME_SPEC_RE.match(candidate)
+    if not match:
+        return "", ""
+    name = match.group(1).strip()
+    remainder = match.group(2).strip()
+    return name, remainder
+
+
+def extract_python_mapping_spec(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, bool):
+        return "*" if value else ""
+    if isinstance(value, dict):
+        if "version" in value and value["version"] is not None:
+            return str(value["version"]).strip()
+        return json.dumps(value, sort_keys=True)
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def parse_package_json_dependencies(text: str) -> dict[str, str]:
+    payload = json.loads(text)
+    dependencies: dict[str, str] = {}
+    if not isinstance(payload, dict):
+        return dependencies
+    for section in PACKAGE_JSON_DEPENDENCY_SECTIONS:
+        section_payload = payload.get(section)
+        if not isinstance(section_payload, dict):
+            continue
+        for name, spec in section_payload.items():
+            normalized_name = str(name).strip()
+            normalized_spec = str(spec).strip() if spec is not None else ""
+            if normalized_name and normalized_spec:
+                dependencies[f"{section}:{normalized_name}"] = normalized_spec
+    return dependencies
+
+
+def parse_requirements_dependencies(text: str) -> dict[str, str]:
+    dependencies: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if " #" in line:
+            line = line.split(" #", 1)[0].strip()
+        if line.endswith("\\"):
+            line = line[:-1].strip()
+        name, remainder = parse_python_requirement_entry(line)
+        if not name:
+            continue
+        dependencies[f"requirements:{name}"] = remainder
+    return dependencies
+
+
+def parse_pyproject_dependency_list(entries: Any, prefix: str) -> dict[str, str]:
+    dependencies: dict[str, str] = {}
+    if not isinstance(entries, list):
+        return dependencies
+    for item in entries:
+        if not isinstance(item, str):
+            continue
+        name, spec = parse_python_requirement_entry(item)
+        if not name:
+            continue
+        dependencies[f"{prefix}:{name}"] = spec
+    return dependencies
+
+
+def parse_pyproject_dependencies(text: str) -> dict[str, str]:
+    payload = tomllib.loads(text)
+    dependencies: dict[str, str] = {}
+
+    project = payload.get("project")
+    if isinstance(project, dict):
+        dependencies.update(parse_pyproject_dependency_list(project.get("dependencies"), "project"))
+        optional_dependencies = project.get("optional-dependencies")
+        if isinstance(optional_dependencies, dict):
+            for group_name, group_entries in optional_dependencies.items():
+                dependencies.update(
+                    parse_pyproject_dependency_list(group_entries, f"project.optional.{group_name}")
+                )
+
+    tool = payload.get("tool")
+    if not isinstance(tool, dict):
+        return dependencies
+    poetry = tool.get("poetry")
+    if not isinstance(poetry, dict):
+        return dependencies
+
+    poetry_dependencies = poetry.get("dependencies")
+    if isinstance(poetry_dependencies, dict):
+        for name, value in poetry_dependencies.items():
+            normalized_name = str(name).strip()
+            if not normalized_name or normalized_name.lower() == "python":
+                continue
+            dependencies[f"poetry:{normalized_name}"] = extract_python_mapping_spec(value)
+
+    legacy_dev_dependencies = poetry.get("dev-dependencies")
+    if isinstance(legacy_dev_dependencies, dict):
+        for name, value in legacy_dev_dependencies.items():
+            normalized_name = str(name).strip()
+            if normalized_name:
+                dependencies[f"poetry.dev:{normalized_name}"] = extract_python_mapping_spec(value)
+
+    poetry_groups = poetry.get("group")
+    if isinstance(poetry_groups, dict):
+        for group_name, group_payload in poetry_groups.items():
+            if not isinstance(group_payload, dict):
+                continue
+            group_dependencies = group_payload.get("dependencies")
+            if not isinstance(group_dependencies, dict):
+                continue
+            for name, value in group_dependencies.items():
+                normalized_name = str(name).strip()
+                if normalized_name and normalized_name.lower() != "python":
+                    dependencies[f"poetry.group.{group_name}:{normalized_name}"] = extract_python_mapping_spec(value)
+
+    return dependencies
+
+
+def parse_setup_cfg_requirement_block(value: str, prefix: str) -> dict[str, str]:
+    dependencies: dict[str, str] = {}
+    for raw_line in value.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if " #" in line:
+            line = line.split(" #", 1)[0].strip()
+        name, spec = parse_python_requirement_entry(line)
+        if name:
+            dependencies[f"{prefix}:{name}"] = spec
+    return dependencies
+
+
+def parse_setup_cfg_dependencies(text: str) -> dict[str, str]:
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.optionxform = str
+    parser.read_string(text)
+    dependencies: dict[str, str] = {}
+
+    if parser.has_option("options", "install_requires"):
+        dependencies.update(parse_setup_cfg_requirement_block(parser.get("options", "install_requires"), "install_requires"))
+
+    if parser.has_section("options.extras_require"):
+        for extra_name, extra_value in parser.items("options.extras_require"):
+            dependencies.update(parse_setup_cfg_requirement_block(extra_value, f"extras_require.{extra_name}"))
+
+    return dependencies
+
+
+def parse_pipfile_dependencies(text: str) -> dict[str, str]:
+    payload = tomllib.loads(text)
+    dependencies: dict[str, str] = {}
+    for section in ("packages", "dev-packages"):
+        section_payload = payload.get(section)
+        if not isinstance(section_payload, dict):
+            continue
+        for name, value in section_payload.items():
+            normalized_name = str(name).strip()
+            if normalized_name:
+                dependencies[f"{section}:{normalized_name}"] = extract_python_mapping_spec(value)
+    return dependencies
+
+
+def parse_setup_py_dependencies(text: str) -> dict[str, str]:
+    normalized = normalize_dependency_text(text)
+    return {"setup.py:__raw__": normalized} if normalized else {}
+
+
+def parse_dependency_file(path: Path, text: str) -> dict[str, str]:
+    kind = dependency_file_kind(path)
+    if kind == "package_json":
+        return parse_package_json_dependencies(text)
+    if kind == "requirements":
+        return parse_requirements_dependencies(text)
+    if kind == "pyproject":
+        return parse_pyproject_dependencies(text)
+    if kind == "setup_cfg":
+        return parse_setup_cfg_dependencies(text)
+    if kind == "pipfile":
+        return parse_pipfile_dependencies(text)
+    if kind == "setup_py":
+        return parse_setup_py_dependencies(text)
+    return {}
+
+
+def iter_dependency_guard_files(workspace: Path) -> list[Path]:
+    paths: list[Path] = []
+    for path in sorted(workspace.rglob("*")):
+        if any(part in IGNORE_DIRECTORIES for part in path.parts):
+            continue
+        if not path.is_file():
+            continue
+        if is_dependency_guard_path(path):
+            paths.append(path)
+    return paths
+
+
+def build_dependency_snapshot_entry(workspace: Path, path: Path) -> dict[str, Any]:
+    text = path.read_text(encoding="utf-8")
+    kind = dependency_file_kind(path)
+    assert kind is not None
+    try:
+        dependencies = parse_dependency_file(path, text)
+    except (configparser.Error, json.JSONDecodeError, tomllib.TOMLDecodeError, UnicodeDecodeError):
+        dependencies = {f"{path.name}:__raw__": normalize_dependency_text(text)}
+
+    return {
+        "path": str(path.relative_to(workspace)),
+        "kind": kind,
+        "ecosystem": dependency_file_ecosystem(path),
+        "lockfile": kind == "lockfile",
+        "fingerprint": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "semantic_fingerprint": hash_payload(dependencies),
+        "dependencies": dependencies,
+    }
+
+
+def collect_dependency_snapshot(workspace: Path) -> dict[str, Any]:
+    files: dict[str, dict[str, Any]] = {}
+    for path in iter_dependency_guard_files(workspace):
+        entry = build_dependency_snapshot_entry(workspace, path)
+        files[entry["path"]] = entry
+    return {
+        "captured_at": iso_now(),
+        "workspace": str(workspace),
+        "files": files,
+    }
+
+
+def snapshot_dependency_guard(workspace: Path, turn_id: str) -> str:
+    state_path = guard_state_path(workspace, turn_id)
+    payload = {
+        "turn_id": turn_id,
+        "workspace": str(workspace),
+        "captured_at": iso_now(),
+        "snapshot": collect_dependency_snapshot(workspace),
+        "allowlist": [],
+    }
+    write_json(state_path, payload)
+    return str(state_path)
+
+
+def load_guard_state(workspace: Path, turn_id: str) -> dict[str, Any]:
+    state_path = guard_state_path(workspace, turn_id)
+    payload = load_json_file(state_path, default={})
+    return payload if isinstance(payload, dict) else {}
+
+
+def record_dependency_guard_allowlist(workspace: Path, turn_id: str, expected_mutations: list[dict[str, Any]]) -> str:
+    state_path = guard_state_path(workspace, turn_id)
+    payload = load_guard_state(workspace, turn_id)
+    if not payload:
+        payload = {
+            "turn_id": turn_id,
+            "workspace": str(workspace),
+            "captured_at": iso_now(),
+            "snapshot": collect_dependency_snapshot(workspace),
+            "allowlist": [],
+        }
+
+    allowlist = payload.get("allowlist")
+    if not isinstance(allowlist, list):
+        allowlist = []
+    seen = {json.dumps(item, sort_keys=True) for item in allowlist if isinstance(item, dict)}
+    for mutation in expected_mutations:
+        key = json.dumps(mutation, sort_keys=True)
+        if key not in seen:
+            allowlist.append(mutation)
+            seen.add(key)
+    payload["allowlist"] = allowlist
+    write_json(state_path, payload)
+    return str(state_path)
+
+
+def diff_dependency_snapshots(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    before_files = before.get("files") or {}
+    after_files = after.get("files") or {}
+    manifest_changes: list[dict[str, Any]] = []
+    lockfile_changes: list[dict[str, Any]] = []
+
+    all_paths = sorted(set(before_files) | set(after_files))
+    for path in all_paths:
+        before_entry = before_files.get(path)
+        after_entry = after_files.get(path)
+        exemplar = after_entry or before_entry or {}
+        if exemplar.get("lockfile"):
+            if before_entry != after_entry:
+                lockfile_changes.append(
+                    {
+                        "path": path,
+                        "ecosystem": exemplar.get("ecosystem"),
+                        "before": before_entry.get("fingerprint") if isinstance(before_entry, dict) else None,
+                        "after": after_entry.get("fingerprint") if isinstance(after_entry, dict) else None,
+                    }
+                )
+            continue
+
+        before_dependencies = (before_entry or {}).get("dependencies") or {}
+        after_dependencies = (after_entry or {}).get("dependencies") or {}
+        if (before_entry or {}).get("semantic_fingerprint") == (after_entry or {}).get("semantic_fingerprint"):
+            continue
+
+        for key in sorted(set(before_dependencies) | set(after_dependencies)):
+            before_spec = before_dependencies.get(key)
+            after_spec = after_dependencies.get(key)
+            if before_spec == after_spec:
+                continue
+            manifest_changes.append(
+                {
+                    "path": path,
+                    "ecosystem": exemplar.get("ecosystem"),
+                    "entry": key,
+                    "name": dependency_entry_name(key),
+                    "before": before_spec,
+                    "after": after_spec,
+                }
+            )
+
+    return {"manifest_changes": manifest_changes, "lockfile_changes": lockfile_changes}
+
+
+def allowlist_matches_manifest_change(change: dict[str, Any], allowlist: list[dict[str, Any]]) -> bool:
+    name = str(change.get("name", "")).strip()
+    ecosystem = str(change.get("ecosystem", "")).strip()
+    after_spec = change.get("after")
+    for mutation in allowlist:
+        if not isinstance(mutation, dict):
+            continue
+        if str(mutation.get("ecosystem", "")).strip() != ecosystem:
+            continue
+        if str(mutation.get("name", "")).strip() != name:
+            continue
+        if str(mutation.get("expected_version", "")).strip() != str(after_spec or "").strip():
+            continue
+        return True
+    return False
+
+
+def allowlist_covers_lockfile_change(change: dict[str, Any], allowlist: list[dict[str, Any]]) -> bool:
+    ecosystem = str(change.get("ecosystem", "")).strip()
+    return any(
+        isinstance(mutation, dict) and str(mutation.get("ecosystem", "")).strip() == ecosystem
+        for mutation in allowlist
+    )
+
+
+def summarize_dependency_guard_diff(
+    unexpected_manifest_changes: list[dict[str, Any]],
+    unexpected_lockfile_changes: list[dict[str, Any]],
+) -> str:
+    lines: list[str] = []
+    for change in unexpected_manifest_changes[:5]:
+        before = change.get("before")
+        after = change.get("after")
+        if before is None:
+            detail = f"added `{change['name']}` as `{after}` in `{change['path']}`"
+        elif after is None:
+            detail = f"removed `{change['name']}` from `{change['path']}`"
+        else:
+            detail = f"changed `{change['name']}` in `{change['path']}` from `{before}` to `{after}`"
+        lines.append(detail)
+    for change in unexpected_lockfile_changes[:5]:
+        lines.append(f"modified lockfile `{change['path']}` without a vetted same-turn install")
+    return "; ".join(lines)
+
+
+def assess_dependency_guard(workspace: Path, turn_id: str) -> dict[str, Any]:
+    payload = load_guard_state(workspace, turn_id)
+    if not payload:
+        return {"block": False, "message": None, "diff": {"manifest_changes": [], "lockfile_changes": []}}
+
+    before_snapshot = payload.get("snapshot")
+    if not isinstance(before_snapshot, dict):
+        return {"block": False, "message": None, "diff": {"manifest_changes": [], "lockfile_changes": []}}
+
+    after_snapshot = collect_dependency_snapshot(workspace)
+    diff = diff_dependency_snapshots(before_snapshot, after_snapshot)
+    allowlist = payload.get("allowlist")
+    if not isinstance(allowlist, list):
+        allowlist = []
+
+    unexpected_manifest_changes = [
+        change for change in diff["manifest_changes"] if not allowlist_matches_manifest_change(change, allowlist)
+    ]
+    unexpected_lockfile_changes = [
+        change for change in diff["lockfile_changes"] if not allowlist_covers_lockfile_change(change, allowlist)
+    ]
+
+    if not unexpected_manifest_changes and not unexpected_lockfile_changes:
+        return {"block": False, "message": None, "diff": diff}
+
+    summary = summarize_dependency_guard_diff(unexpected_manifest_changes, unexpected_lockfile_changes)
+    message = (
+        "Pounce found dependency-file changes that were not explained by a vetted same-turn install: "
+        f"{summary}. Before stopping, either revert those edits or rerun the dependency change through "
+        "`pounce.vet` and an exact install command so Pounce can record the expected mutation."
+    )
+    return {
+        "block": True,
+        "message": message,
+        "diff": diff,
+        "unexpected_manifest_changes": unexpected_manifest_changes,
+        "unexpected_lockfile_changes": unexpected_lockfile_changes,
+    }
+
+
 def include_scan_path(workspace: Path, path: Path) -> bool:
     if path.name in TEXT_FILE_NAMES:
         return True
@@ -1012,13 +1738,14 @@ def include_scan_path(workspace: Path, path: Path) -> bool:
     return relative_parent in TEXT_SCAN_DIRECTORIES and path.suffix.lower() in {".yml", ".yaml"}
 
 
-def should_scan_mechanisms(path: Path, workspace: Path) -> bool:
-    if path.name in {"package.json", "setup.py", "pyproject.toml", "setup.cfg"}:
-        return True
-    if path.suffix.lower() in {".py", ".pth", ".sh", ".bash", ".zsh"}:
-        return True
-    relative_parent = str(path.parent.relative_to(workspace)) if path.parent != workspace else ""
-    return relative_parent in TEXT_SCAN_DIRECTORIES and path.suffix.lower() in {".yml", ".yaml"}
+def mechanism_contexts_for_path(path: Path) -> set[str]:
+    if path.name == "package.json":
+        return {"npm_install"}
+    if path.name in {"setup.py", "pyproject.toml", "setup.cfg"}:
+        return {"python_install"}
+    if path.suffix.lower() == ".pth":
+        return {"python_persistence"}
+    return set()
 
 
 def scan_workspace(workspace: Path, indicators: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1058,8 +1785,14 @@ def scan_workspace(workspace: Path, indicators: list[dict[str, Any]]) -> list[di
             finding["evidence"] += f" File: {relative_path}."
             findings.append(finding)
 
-        if should_scan_mechanisms(path, workspace):
-            for finding in scan_mechanisms(content, source="install_scan", artifact=relative_path):
+        mechanism_contexts = mechanism_contexts_for_path(path)
+        if mechanism_contexts:
+            for finding in scan_mechanisms(
+                content,
+                source="install_scan",
+                artifact=relative_path,
+                contexts=mechanism_contexts,
+            ):
                 finding["evidence"] += f" File: {relative_path}."
                 findings.append(finding)
 
@@ -1091,7 +1824,7 @@ def scan_workspace(workspace: Path, indicators: list[dict[str, Any]]) -> list[di
     return deduped
 
 
-def vet_payload(payload: dict[str, Any], plugin_root: Path) -> dict[str, Any]:
+def vet_payload(payload: dict[str, Any], plugin_root: Path, *, write_stamp_enabled: bool = True) -> dict[str, Any]:
     mode = str(payload.get("mode", "release")).strip().lower()
     ecosystem = normalize_ecosystem(payload.get("ecosystem"))
     package_name = str(payload.get("package_name", "")).strip()
@@ -1110,6 +1843,11 @@ def vet_payload(payload: dict[str, Any], plugin_root: Path) -> dict[str, Any]:
 
     indicators = collect_iocs(plugin_root)
     findings: list[dict[str, Any]] = []
+    recommended_version: str | None = None
+    recommended_command: str | None = None
+    baseline_version: str | None = None
+    baseline_source: str | None = None
+    next_action: str | None = None
 
     if mode not in {"release", "sweep"}:
         findings.append(
@@ -1139,8 +1877,24 @@ def vet_payload(payload: dict[str, Any], plugin_root: Path) -> dict[str, Any]:
             artifact = f"{package_name}@{version}" if ecosystem == "npm" else f"{package_name}=={version}"
             if ecosystem == "npm":
                 findings.extend(check_npm_release(package_name, version, workspace))
+                try:
+                    package_index = load_npm_package_index(package_name)
+                except VerificationUnavailable:
+                    package_index = None
+                if isinstance(package_index, dict):
+                    baseline_version, baseline_source = resolve_npm_release_baseline(
+                        package_index, package_name, version, workspace
+                    )
             elif ecosystem == "pypi":
                 findings.extend(check_pypi_release(package_name, version))
+                try:
+                    package_index = load_pypi_package_index(package_name)
+                except VerificationUnavailable:
+                    package_index = None
+                if isinstance(package_index, dict):
+                    baseline_version, baseline_source = resolve_pypi_release_baseline(
+                        package_index, package_name, version, workspace
+                    )
         elif package_name or version:
             findings.append(
                 build_verification_unavailable(
@@ -1177,7 +1931,7 @@ def vet_payload(payload: dict[str, Any], plugin_root: Path) -> dict[str, Any]:
     checked_at = iso_now()
     summary = summarize_findings(verdict, findings, artifact, mode)
     stamp_path = None
-    if workspace:
+    if workspace and write_stamp_enabled:
         stamp_payload = {
             "mode": mode,
             "request": payload,
@@ -1185,6 +1939,11 @@ def vet_payload(payload: dict[str, Any], plugin_root: Path) -> dict[str, Any]:
             "summary": summary,
             "findings": findings,
             "checked_at": checked_at,
+            "recommended_version": recommended_version,
+            "recommended_command": recommended_command,
+            "baseline_version": baseline_version,
+            "baseline_source": baseline_source,
+            "next_action": next_action,
         }
         slug_source = artifact or workspace.name
         stamp_path = write_stamp(build_stamp_path(workspace, mode, slug_source), stamp_payload)
@@ -1195,86 +1954,524 @@ def vet_payload(payload: dict[str, Any], plugin_root: Path) -> dict[str, Any]:
         "findings": findings,
         "checked_at": checked_at,
         "stamp_path": stamp_path,
+        "recommended_version": recommended_version,
+        "recommended_command": recommended_command,
+        "baseline_version": baseline_version,
+        "baseline_source": baseline_source,
+        "next_action": next_action,
     }
 
 
-def parse_npm_spec(spec: str) -> tuple[str, str | None]:
-    if spec.startswith("@"):
-        pivot = spec.rfind("@")
-        slash = spec.find("/")
+def split_shell_segments(command: str) -> list[tuple[str, str | None]]:
+    segments: list[tuple[str, str | None]] = []
+    buffer: list[str] = []
+    in_single = False
+    in_double = False
+    index = 0
+
+    while index < len(command):
+        char = command[index]
+        next_two = command[index : index + 2]
+        previous = command[index - 1] if index > 0 else ""
+
+        if char == "'" and not in_double:
+            in_single = not in_single
+            buffer.append(char)
+            index += 1
+            continue
+        if char == '"' and not in_single and previous != "\\":
+            in_double = not in_double
+            buffer.append(char)
+            index += 1
+            continue
+
+        if not in_single and not in_double:
+            if next_two in {"&&", "||"}:
+                raw = "".join(buffer).strip()
+                if raw:
+                    segments.append((raw, next_two))
+                buffer = []
+                index += 2
+                continue
+            if char == ";" or (char == "\n" and previous != "\\"):
+                raw = "".join(buffer).strip()
+                if raw:
+                    segments.append((raw, "\n" if char == "\n" else char))
+                buffer = []
+                index += 1
+                continue
+
+        buffer.append(char)
+        index += 1
+
+    tail = "".join(buffer).strip()
+    if tail:
+        segments.append((tail, None))
+    elif segments and segments[-1][1] is not None:
+        segments[-1] = (segments[-1][0], None)
+    return segments
+
+
+def version_sort_key(version: str) -> tuple[Any, ...]:
+    match = re.match(r"^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$", version.strip())
+    if not match:
+        return (0, version)
+    prerelease = match.group(4) or ""
+    prerelease_key = tuple(str(part) for part in prerelease.split(".") if part)
+    return (
+        1,
+        int(match.group(1)),
+        int(match.group(2) or 0),
+        int(match.group(3) or 0),
+        1 if not prerelease else 0,
+        prerelease_key,
+    )
+
+
+def compare_versions(left: str, right: str) -> int:
+    left_key = version_sort_key(left)
+    right_key = version_sort_key(right)
+    if left_key == right_key:
+        return 0
+    return 1 if left_key > right_key else -1
+
+
+def classify_npm_spec(version_spec: str | None) -> str:
+    if not version_spec:
+        return "unpinned"
+    spec = version_spec.strip()
+    if not spec or spec == "*":
+        return "unpinned"
+    if NPM_EXACT_VERSION_RE.fullmatch(spec):
+        return "exact"
+    return "range"
+
+
+def parse_npm_spec(spec: str) -> tuple[str, str | None, str]:
+    token = spec.strip()
+    if token.startswith("@"):
+        pivot = token.rfind("@")
+        slash = token.find("/")
         if pivot > slash > 0:
-            name = spec[:pivot]
-            version = spec[pivot + 1 :]
-            return name, version or None
-        return spec, None
-    if "@" not in spec:
-        return spec, None
-    name, version = spec.rsplit("@", 1)
-    return name, version or None
+            name = token[:pivot]
+            version_spec = token[pivot + 1 :] or None
+            return name, version_spec, classify_npm_spec(version_spec)
+        return token, None, "unpinned"
+    if "@" not in token:
+        return token, None, "unpinned"
+    name, version_spec = token.rsplit("@", 1)
+    version_spec = version_spec or None
+    return name, version_spec, classify_npm_spec(version_spec)
 
 
-def parse_python_spec(spec: str) -> tuple[str, str | None]:
-    for separator in ("===", "=="):
-        if separator in spec:
-            name, version = spec.split(separator, 1)
-            return name, version or None
-    return spec, None
+def classify_python_spec(version_spec: str | None) -> str:
+    if not version_spec:
+        return "unpinned"
+    spec = version_spec.strip()
+    if not spec or spec == "*":
+        return "unpinned"
+    if PYTHON_EXACT_SPEC_RE.fullmatch(spec):
+        return "exact"
+    return "range"
+
+
+def parse_python_spec(spec: str) -> tuple[str, str | None, str]:
+    name, version_spec = parse_python_requirement_entry(spec)
+    if not name:
+        return spec.strip(), None, "unpinned"
+    normalized_spec = version_spec or None
+    spec_kind = classify_python_spec(normalized_spec)
+    if spec_kind == "exact" and normalized_spec:
+        for separator in ("===", "=="):
+            if normalized_spec.startswith(separator):
+                normalized_spec = normalized_spec[len(separator) :].strip()
+                break
+    return name, normalized_spec, spec_kind
+
+
+def flag_takes_value(manager: str, token: str) -> bool:
+    if "=" in token:
+        return False
+    return token in COMMAND_FLAGS_WITH_VALUES.get(manager, set())
+
+
+def extract_dependency_segments(command: str) -> list[DependencyCommandSegment]:
+    segments: list[DependencyCommandSegment] = []
+    for index, (raw, separator) in enumerate(split_shell_segments(command)):
+        try:
+            tokens = shlex.split(raw)
+        except ValueError:
+            continue
+        if not tokens:
+            continue
+
+        matched_pattern: tuple[tuple[str, ...], str, str, str] | None = None
+        for pattern in COMMAND_PATTERNS:
+            prefix, ecosystem, manager, verb = pattern
+            if tuple(tokens[: len(prefix)]) == prefix:
+                matched_pattern = (prefix, ecosystem, manager, verb)
+                break
+        if matched_pattern is None:
+            continue
+
+        prefix, ecosystem, manager, verb = matched_pattern
+        dependencies: list[DependencyCommand] = []
+        token_index = len(prefix)
+        while token_index < len(tokens):
+            token = tokens[token_index]
+            if token.startswith("-"):
+                if flag_takes_value(manager, token) and token_index + 1 < len(tokens):
+                    token_index += 2
+                else:
+                    token_index += 1
+                continue
+            if token in {".", ".."} or "://" in token:
+                token_index += 1
+                continue
+            if ecosystem == "npm":
+                name, version_spec, spec_kind = parse_npm_spec(token)
+            else:
+                name, version_spec, spec_kind = parse_python_spec(token)
+            if name.strip():
+                dependencies.append(
+                    DependencyCommand(
+                        ecosystem=ecosystem,
+                        manager=manager,
+                        verb=verb,
+                        name=name.strip(),
+                        version_spec=(version_spec or "").strip() or None,
+                        original=token,
+                        spec_kind=spec_kind,
+                        segment_index=index,
+                        token_index=token_index,
+                    )
+                )
+            token_index += 1
+
+        if dependencies:
+            segments.append(
+                DependencyCommandSegment(
+                    raw=raw,
+                    separator=separator,
+                    tokens=tokens,
+                    prefix_length=len(prefix),
+                    ecosystem=ecosystem,
+                    manager=manager,
+                    verb=verb,
+                    index=index,
+                    dependencies=dependencies,
+                )
+            )
+    return segments
 
 
 def extract_dependency_commands(command: str) -> list[DependencyCommand]:
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
-        return []
-    if len(tokens) < 2:
-        return []
+    commands: list[DependencyCommand] = []
+    for segment in extract_dependency_segments(command):
+        commands.extend(segment.dependencies)
+    return commands
 
-    for prefix, ecosystem in DEPENDENCY_COMMAND_PREFIXES.items():
-        if tuple(tokens[: len(prefix)]) != prefix:
-            continue
 
-        packages: list[DependencyCommand] = []
-        for token in tokens[len(prefix) :]:
-            if token.startswith("-"):
+def normalize_comparison_version(version: str) -> tuple[int, int, int]:
+    match = re.match(r"^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?", version.strip())
+    if not match:
+        return 0, 0, 0
+    return int(match.group(1)), int(match.group(2) or 0), int(match.group(3) or 0)
+
+
+def increment_version(version: tuple[int, int, int], field: str) -> tuple[int, int, int]:
+    major, minor, patch = version
+    if field == "major":
+        return major + 1, 0, 0
+    if field == "minor":
+        return major, minor + 1, 0
+    return major, minor, patch + 1
+
+
+def format_version_tuple(version: tuple[int, int, int]) -> str:
+    return ".".join(str(part) for part in version)
+
+
+def npm_version_satisfies(version: str, spec: str | None, dist_tags: dict[str, Any] | None = None) -> bool:
+    if not spec or spec.strip() in {"", "*"}:
+        return True
+    candidate = version.strip()
+    requested = spec.strip()
+    if requested in (dist_tags or {}):
+        return str((dist_tags or {})[requested]).strip() == candidate
+    if requested == "latest":
+        return True
+    if "||" in requested:
+        return any(npm_version_satisfies(candidate, part.strip(), dist_tags) for part in requested.split("||"))
+    if requested.startswith("^"):
+        lower = normalize_comparison_version(requested[1:])
+        if compare_versions(candidate, format_version_tuple(lower)) < 0:
+            return False
+        if lower[0] > 0:
+            upper = increment_version(lower, "major")
+        elif lower[1] > 0:
+            upper = increment_version(lower, "minor")
+        else:
+            upper = increment_version(lower, "patch")
+        return compare_versions(candidate, format_version_tuple(upper)) < 0
+    if requested.startswith("~"):
+        lower = normalize_comparison_version(requested[1:])
+        if compare_versions(candidate, format_version_tuple(lower)) < 0:
+            return False
+        parts = requested[1:].split(".")
+        if len(parts) <= 1:
+            upper = increment_version(lower, "major")
+        else:
+            upper = increment_version(lower, "minor")
+        return compare_versions(candidate, format_version_tuple(upper)) < 0
+    if re.fullmatch(r"v?\d+(?:\.\d+)?(?:\.(?:\d+|[xX*]))?(?:[xX*])?", requested) or any(
+        marker in requested for marker in ("x", "X", "*")
+    ):
+        wildcard = requested.replace("*", "x").replace("X", "x").lstrip("v")
+        parts = wildcard.split(".")
+        major = int(parts[0]) if parts[0] and parts[0] != "x" else 0
+        if len(parts) == 1 or parts[1] == "x":
+            lower = (major, 0, 0)
+            upper = (major + 1, 0, 0)
+        elif len(parts) == 2 or parts[2] == "x":
+            lower = (major, int(parts[1]), 0)
+            upper = (major, int(parts[1]) + 1, 0)
+        else:
+            lower = (major, int(parts[1]), int(parts[2]))
+            upper = increment_version(lower, "patch")
+        return compare_versions(candidate, format_version_tuple(lower)) >= 0 and compare_versions(
+            candidate, format_version_tuple(upper)
+        ) < 0
+    if any(requested.startswith(prefix) for prefix in (">=", "<=", ">", "<")) or " " in requested:
+        clauses = [clause for clause in requested.split() if clause]
+        for clause in clauses:
+            operator = next((item for item in (">=", "<=", ">", "<", "=") if clause.startswith(item)), None)
+            if operator is None:
                 continue
-            if token in {".", ".."} or "://" in token:
-                continue
-            if ecosystem == "npm":
-                name, version = parse_npm_spec(token)
+            boundary = clause[len(operator) :].strip()
+            comparison = compare_versions(candidate, boundary)
+            if operator == ">=" and comparison < 0:
+                return False
+            if operator == "<=" and comparison > 0:
+                return False
+            if operator == ">" and comparison <= 0:
+                return False
+            if operator == "<" and comparison >= 0:
+                return False
+            if operator == "=" and comparison != 0:
+                return False
+        return True
+    return candidate == requested.lstrip("v")
+
+
+def python_version_satisfies(version: str, spec: str | None) -> bool:
+    if not spec or spec.strip() in {"", "*"}:
+        return True
+    candidate = version.strip()
+    requested = spec.strip()
+    if " " in requested and "," not in requested and not requested.startswith(("==", "===", ">=", "<=", "~=", "!=", ">", "<")):
+        return False
+    clauses = [clause.strip() for clause in requested.split(",") if clause.strip()]
+    for clause in clauses:
+        operator = next((item for item in ("===", "==", ">=", "<=", "~=", "!=", ">", "<") if clause.startswith(item)), None)
+        if operator is None:
+            return False
+        boundary = clause[len(operator) :].strip()
+        comparison = compare_versions(candidate, boundary)
+        if operator in {"===", "=="} and comparison != 0:
+            return False
+        if operator == "!=" and comparison == 0:
+            return False
+        if operator == ">=" and comparison < 0:
+            return False
+        if operator == "<=" and comparison > 0:
+            return False
+        if operator == ">" and comparison <= 0:
+            return False
+        if operator == "<" and comparison >= 0:
+            return False
+        if operator == "~=":
+            lower = normalize_comparison_version(boundary)
+            if comparison < 0:
+                return False
+            parts = boundary.split(".")
+            if len(parts) >= 3:
+                upper = (lower[0], lower[1] + 1, 0)
             else:
-                name, version = parse_python_spec(token)
-            packages.append(
-                DependencyCommand(
-                    ecosystem=ecosystem,
-                    name=name.strip(),
-                    version=(version or "").strip() or None,
-                    original=token,
-                )
+                upper = (lower[0] + 1, 0, 0)
+            if compare_versions(candidate, format_version_tuple(upper)) >= 0:
+                return False
+    return True
+
+
+def package_release_sort_key(version: str, published_at: datetime | None) -> tuple[Any, ...]:
+    timestamp = published_at.timestamp() if published_at else 0.0
+    return (timestamp, version_sort_key(version))
+
+
+def build_exact_dependency_token(dependency: DependencyCommand, version: str) -> str:
+    if dependency.ecosystem == "npm":
+        return f"{dependency.name}@{version}"
+    return f"{dependency.name}=={version}"
+
+
+def evaluate_recommendation_candidate(
+    dependency: DependencyCommand,
+    candidate_version: str,
+    plugin_root: Path,
+    workspace: Path,
+) -> dict[str, Any]:
+    package_name = dependency.name if dependency.ecosystem == "npm" else dependency.name.split("[", 1)[0]
+    return vet_payload(
+        {
+            "mode": "release",
+            "ecosystem": dependency.ecosystem,
+            "package_name": package_name,
+            "version": candidate_version,
+            "workspace": str(workspace),
+            "reason": f"Remediation rewrite for `{dependency.original}`.",
+            "artifacts": [dependency.original],
+        },
+        plugin_root,
+        write_stamp_enabled=False,
+    )
+
+
+def recommend_vetted_version(dependency: DependencyCommand, plugin_root: Path, workspace: Path) -> dict[str, Any]:
+    baseline_version: str | None = None
+    baseline_source: str | None = None
+    recommended_version: str | None = None
+    package_name = dependency.name if dependency.ecosystem == "npm" else dependency.name.split("[", 1)[0]
+
+    try:
+        if dependency.ecosystem == "npm":
+            package_index = load_npm_package_index(package_name)
+            dist_tags = package_index.get("dist-tags", {}) if isinstance(package_index, dict) else {}
+            versions = package_index.get("versions", {}) if isinstance(package_index, dict) else {}
+            candidate_versions = [
+                version
+                for version in versions
+                if npm_version_satisfies(version, dependency.version_spec, dist_tags if isinstance(dist_tags, dict) else {})
+            ]
+            candidate_versions.sort(
+                key=lambda version: package_release_sort_key(
+                    version, parse_timestamp((package_index.get("time", {}) or {}).get(version))
+                ),
+                reverse=True,
             )
-        return packages
-    return []
+            if candidate_versions:
+                baseline_version, baseline_source = resolve_npm_release_baseline(
+                    package_index, package_name, candidate_versions[0], workspace
+                )
+        else:
+            package_index = load_pypi_package_index(package_name)
+            releases = package_index.get("releases", {}) if isinstance(package_index, dict) else {}
+            candidate_versions = [
+                version
+                for version in releases
+                if python_version_satisfies(version, dependency.version_spec)
+            ]
+            candidate_versions.sort(
+                key=lambda version: package_release_sort_key(version, pypi_release_uploaded_at(releases, version)),
+                reverse=True,
+            )
+            if candidate_versions:
+                baseline_version, baseline_source = resolve_pypi_release_baseline(
+                    package_index, package_name, candidate_versions[0], workspace
+                )
+    except VerificationUnavailable:
+        candidate_versions = []
+
+    for candidate_version in candidate_versions:
+        result = evaluate_recommendation_candidate(dependency, candidate_version, plugin_root, workspace)
+        if result["verdict"] == "allow":
+            recommended_version = candidate_version
+            break
+
+    return {
+        "recommended_version": recommended_version,
+        "baseline_version": baseline_version,
+        "baseline_source": baseline_source,
+        "next_action": "rewrite_command" if recommended_version else "manual_review",
+    }
+
+
+def build_recommended_command(
+    command: str,
+    segments: list[DependencyCommandSegment],
+    replacements: dict[tuple[int, int], str],
+) -> str | None:
+    if not replacements:
+        return None
+
+    rewritten_segments: dict[int, str] = {}
+    for segment in segments:
+        segment_replacements = {
+            token_index: version
+            for (segment_index, token_index), version in replacements.items()
+            if segment_index == segment.index
+        }
+        if not segment_replacements:
+            continue
+        tokens = list(segment.tokens)
+        for token_index, version in segment_replacements.items():
+            dependency = next(dep for dep in segment.dependencies if dep.token_index == token_index)
+            tokens[token_index] = build_exact_dependency_token(dependency, version)
+        exact_flag = NPM_EXACT_SAVE_FLAGS.get((segment.manager, segment.verb))
+        if exact_flag and exact_flag not in tokens:
+            tokens.append(exact_flag)
+        rewritten_segments[segment.index] = shlex.join(tokens)
+
+    pieces: list[str] = []
+    for index, (raw, separator) in enumerate(split_shell_segments(command)):
+        pieces.append(rewritten_segments.get(index, raw.strip()))
+        if separator == "\n":
+            pieces.append("\n")
+        elif separator:
+            pieces.append(f" {separator} ")
+    return "".join(pieces).strip()
 
 
 def assess_dependency_command(command: str, plugin_root: Path, workspace: Path) -> dict[str, Any]:
-    dependencies = extract_dependency_commands(command)
+    segments = extract_dependency_segments(command)
+    dependencies = [dependency for segment in segments for dependency in segment.dependencies]
     if not dependencies:
-        return {"matched": False, "block": False, "message": None, "results": []}
+        return {"matched": False, "block": False, "message": None, "results": [], "expected_mutations": []}
 
     warnings: list[str] = []
     blocks: list[str] = []
     results: list[dict[str, Any]] = []
+    expected_mutations: list[dict[str, Any]] = []
+    recommended_rewrites: dict[tuple[int, int], str] = {}
+    non_exact_result_indexes: list[int] = []
 
     for dependency in dependencies:
         if not dependency.exact:
-            warnings.append(
-                f"Pounce saw `{dependency.original}` without an exact version. Pin the version and run `pounce.vet`."
-            )
+            recommendation = recommend_vetted_version(dependency, plugin_root, workspace)
+            result = {
+                "verdict": "warn",
+                "summary": f"Pounce blocked non-exact dependency spec `{dependency.original}`.",
+                "findings": [],
+                "checked_at": iso_now(),
+                "stamp_path": None,
+                "recommended_version": recommendation["recommended_version"],
+                "recommended_command": None,
+                "baseline_version": recommendation["baseline_version"],
+                "baseline_source": recommendation["baseline_source"],
+                "next_action": recommendation["next_action"],
+            }
+            results.append(result)
+            non_exact_result_indexes.append(len(results) - 1)
+            if recommendation["recommended_version"]:
+                recommended_rewrites[(dependency.segment_index, dependency.token_index)] = recommendation["recommended_version"]
             continue
+
+        package_name = dependency.name if dependency.ecosystem == "npm" else dependency.name.split("[", 1)[0]
         result = vet_payload(
             {
                 "mode": "release",
                 "ecosystem": dependency.ecosystem,
-                "package_name": dependency.name,
+                "package_name": package_name,
                 "version": dependency.version,
                 "workspace": str(workspace),
                 "reason": f"Hook inspection of `{command}`.",
@@ -1285,8 +2482,34 @@ def assess_dependency_command(command: str, plugin_root: Path, workspace: Path) 
         results.append(result)
         if result["verdict"] == "block":
             blocks.append(result["summary"])
-        elif result["verdict"] == "warn":
+            continue
+        if result["verdict"] == "warn":
             warnings.append(result["summary"])
+        if dependency.version:
+            expected_mutations.append(
+                {
+                    "ecosystem": dependency.ecosystem,
+                    "manager": dependency.manager,
+                    "verb": dependency.verb,
+                    "name": dependency.name,
+                    "expected_version": dependency.version,
+                    "command": command,
+                }
+            )
+
+    recommended_command = build_recommended_command(command, segments, recommended_rewrites)
+    for index in non_exact_result_indexes:
+        results[index]["recommended_command"] = recommended_command
+
+    if non_exact_result_indexes:
+        if recommended_command:
+            blocks.append(
+                f"Pounce blocked non-exact dependency installs. Rewrite the command to `{recommended_command}`."
+            )
+        else:
+            blocks.append(
+                "Pounce blocked non-exact dependency installs. No vetted exact rewrite was available, so manual review is required."
+            )
 
     if blocks:
         return {
@@ -1294,6 +2517,9 @@ def assess_dependency_command(command: str, plugin_root: Path, workspace: Path) 
             "block": True,
             "message": "\n".join(blocks[:3]),
             "results": results,
+            "expected_mutations": expected_mutations,
+            "recommended_command": recommended_command,
+            "next_action": "rewrite_command" if recommended_command else "manual_review",
         }
     if warnings:
         return {
@@ -1301,8 +2527,19 @@ def assess_dependency_command(command: str, plugin_root: Path, workspace: Path) 
             "block": False,
             "message": "\n".join(warnings[:3]),
             "results": results,
+            "expected_mutations": expected_mutations,
+            "recommended_command": recommended_command,
+            "next_action": None,
         }
-    return {"matched": True, "block": False, "message": None, "results": results}
+    return {
+        "matched": True,
+        "block": False,
+        "message": None,
+        "results": results,
+        "expected_mutations": expected_mutations,
+        "recommended_command": recommended_command,
+        "next_action": None,
+    }
 
 
 def agents_block_text() -> str:
@@ -1352,18 +2589,18 @@ def is_pounce_hook(hook: Any) -> bool:
     return "pounce_hook.py" in command or status_message == POUNCE_HOOK_STATUS_MESSAGE
 
 
-def render_workspace_hooks(installed_plugin_root: Path, existing_payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    payload = dict(existing_payload or {})
-    hooks = payload.get("hooks")
-    if not isinstance(hooks, dict):
-        hooks = {}
-    payload["hooks"] = hooks
-
-    entries = hooks.get("PreToolUse")
+def ensure_pounce_hook_event(
+    hooks: dict[str, Any],
+    event_name: str,
+    installed_plugin_root: Path,
+    *,
+    matcher: str | None = None,
+) -> None:
+    entries = hooks.get(event_name)
     if not isinstance(entries, list):
         entries = []
 
-    bash_entry_index: int | None = None
+    target_entry_index: int | None = None
     cleaned_entries: list[dict[str, Any]] = []
     for entry in entries:
         if not isinstance(entry, dict):
@@ -1374,19 +2611,38 @@ def render_workspace_hooks(installed_plugin_root: Path, existing_payload: dict[s
             hook_items = []
         filtered_hooks = [hook for hook in hook_items if not is_pounce_hook(hook)]
         entry_copy["hooks"] = filtered_hooks
-        if entry_copy.get("matcher") == "Bash" and bash_entry_index is None:
-            bash_entry_index = len(cleaned_entries)
-        if filtered_hooks or entry_copy.get("matcher") == "Bash":
+        entry_matcher = entry_copy.get("matcher")
+        if matcher is None:
+            if target_entry_index is None and not entry_matcher:
+                target_entry_index = len(cleaned_entries)
+        elif entry_matcher == matcher and target_entry_index is None:
+            target_entry_index = len(cleaned_entries)
+        if filtered_hooks or entry_matcher == matcher or (matcher is None and not entry_matcher):
             cleaned_entries.append(entry_copy)
 
     pounce_hook = pounce_hook_definition(installed_plugin_root)
-    if bash_entry_index is None:
-        cleaned_entries.append({"matcher": "Bash", "hooks": [pounce_hook]})
+    if target_entry_index is None:
+        new_entry: dict[str, Any] = {"hooks": [pounce_hook]}
+        if matcher is not None:
+            new_entry["matcher"] = matcher
+        cleaned_entries.append(new_entry)
     else:
-        cleaned_entries[bash_entry_index].setdefault("hooks", [])
-        cleaned_entries[bash_entry_index]["hooks"].append(pounce_hook)
+        cleaned_entries[target_entry_index].setdefault("hooks", [])
+        cleaned_entries[target_entry_index]["hooks"].append(pounce_hook)
 
-    hooks["PreToolUse"] = cleaned_entries
+    hooks[event_name] = cleaned_entries
+
+
+def render_workspace_hooks(installed_plugin_root: Path, existing_payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = dict(existing_payload or {})
+    hooks = payload.get("hooks")
+    if not isinstance(hooks, dict):
+        hooks = {}
+    payload["hooks"] = hooks
+
+    ensure_pounce_hook_event(hooks, "PreToolUse", installed_plugin_root, matcher="Bash")
+    ensure_pounce_hook_event(hooks, "UserPromptSubmit", installed_plugin_root)
+    ensure_pounce_hook_event(hooks, "Stop", installed_plugin_root)
     return {
         **payload,
         "hooks": hooks,

@@ -16,27 +16,18 @@ SERVER_VERSION = "0.1.0"
 
 
 def read_message() -> dict[str, Any] | None:
-    headers: dict[str, str] = {}
     while True:
         line = sys.stdin.buffer.readline()
         if not line:
             return None
         if line in {b"\r\n", b"\n"}:
-            break
-        name, _, value = line.decode("utf-8").partition(":")
-        headers[name.strip().lower()] = value.strip()
-
-    content_length = int(headers.get("content-length", "0"))
-    if content_length <= 0:
-        return None
-    payload = sys.stdin.buffer.read(content_length)
-    return json.loads(payload.decode("utf-8"))
+            continue
+        return json.loads(line.decode("utf-8"))
 
 
 def send_message(payload: dict[str, Any]) -> None:
-    encoded = json.dumps(payload).encode("utf-8")
-    sys.stdout.buffer.write(f"Content-Length: {len(encoded)}\r\n\r\n".encode("ascii"))
-    sys.stdout.buffer.write(encoded)
+    encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    sys.stdout.buffer.write(encoded + b"\n")
     sys.stdout.buffer.flush()
 
 

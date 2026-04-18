@@ -50,15 +50,6 @@
         "type": "string",
         "value": "litellm_init.pth"
       }
-    },
-    {
-      "id": "ioc-2026-036",
-      "severity": "critical",
-      "reason": "Known malicious Python bootstrap behavior from the March 2026 LiteLLM incident when seen in install-time code.",
-      "match": {
-        "type": "string",
-        "value": "subprocess.Popen"
-      }
     }
   ]
 }
