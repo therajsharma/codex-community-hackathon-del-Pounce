@@ -1,3 +1,7 @@
+<p>
+  <img src="plugins/pounce/assets/pounce-mark.svg" alt="Pounce logo" width="220" />
+</p>
+
 # Pounce
 
 [![Tests](https://github.com/therajsharma/Project-Zero/actions/workflows/test.yml/badge.svg)](https://github.com/therajsharma/Project-Zero/actions/workflows/test.yml)
@@ -52,7 +56,6 @@ Show the Pounce dashboard for this workspace
 
 ## Docs
 
+- [Pitch deck](docs/Pounc_Pitch.pdf)
 - [Plugin README](plugins/pounce/README.md)
 - [Getting started guide](docs/getting-started.md)
-- [Final spec](docs/pounce-final-spec.md)
-- [Pitch deck](docs/Pounc_Pitch.pdf)
