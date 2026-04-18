@@ -19,6 +19,8 @@ from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 import tomllib
 
+import pounce_intel
+
 
 MANAGED_BLOCK_BEGIN = "<!-- BEGIN POUNCE MANAGED BLOCK -->"
 MANAGED_BLOCK_END = "<!-- END POUNCE MANAGED BLOCK -->"
@@ -185,6 +187,7 @@ _IOC_CACHE: dict[str, Any] = {"expires_at": datetime.fromtimestamp(0, tz=UTC), "
 _LAST_GOOD_IOCS: list[dict[str, Any]] = []
 _HTTP_CACHE: dict[str, Any] = {}
 _NPM_VIEW_CACHE: dict[str, dict[str, str]] = {}
+_LAST_INTEL_CONTEXT: dict[str, Any] = {"feed": {"items": []}, "warnings": []}
 
 
 class VerificationUnavailable(Exception):
@@ -326,65 +329,31 @@ def normalize_ecosystem(value: str | None) -> str:
 
 
 def load_seed_iocs(plugin_root: Path) -> list[dict[str, Any]]:
-    data = load_json(plugin_root / "data" / "seed_iocs.json")
-    items = data.get("items", [])
+    context = pounce_intel.runtime_feed(plugin_root, None)
+    feed = context.get("feed", {})
+    items = feed.get("items", []) if isinstance(feed, dict) else []
     return items if isinstance(items, list) else []
 
 
 def parse_live_ioc_payload(payload: str) -> list[dict[str, Any]]:
-    payload = payload.strip()
-    if not payload:
-        return []
-    if payload.startswith("{"):
-        parsed = json.loads(payload)
-        if isinstance(parsed, dict):
-            items = parsed.get("items", [])
-            return items if isinstance(items, list) else []
-    if payload.startswith("["):
-        parsed = json.loads(payload)
-        return parsed if isinstance(parsed, list) else []
-
-    items: list[dict[str, Any]] = []
-    for line in payload.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        parsed = json.loads(line)
-        if isinstance(parsed, dict):
-            items.append(parsed)
-    return items
+    feed = pounce_intel.load_feed_from_text(payload, default_source="live_feed")
+    items = feed.get("items", []) if isinstance(feed, dict) else []
+    return items if isinstance(items, list) else []
 
 
 def load_live_iocs(feed_url: str | None) -> list[dict[str, Any]]:
-    global _IOC_CACHE, _LAST_GOOD_IOCS
-
-    if not feed_url:
-        return []
-
-    if _IOC_CACHE["items"] and now_utc() < _IOC_CACHE["expires_at"]:
-        return list(_IOC_CACHE["items"])
-
-    request = Request(feed_url, headers={"User-Agent": "pounce-local-plugin"})
-    try:
-        with urlopen(request, timeout=20) as response:
-            raw = response.read().decode("utf-8")
-        items = parse_live_ioc_payload(raw)
-    except Exception:
-        if _LAST_GOOD_IOCS:
-            _IOC_CACHE = {"expires_at": now_utc() + LIVE_IOC_TTL, "items": list(_LAST_GOOD_IOCS)}
-            return list(_LAST_GOOD_IOCS)
-        return []
-
-    _LAST_GOOD_IOCS = list(items)
-    _IOC_CACHE = {"expires_at": now_utc() + LIVE_IOC_TTL, "items": list(items)}
-    return items
+    context = pounce_intel.runtime_feed(plugin_root_from_script(__file__), feed_url)
+    feed = context.get("feed", {})
+    items = feed.get("items", []) if isinstance(feed, dict) else []
+    return items if isinstance(items, list) else []
 
 
 def collect_iocs(plugin_root: Path) -> list[dict[str, Any]]:
-    items = list(load_seed_iocs(plugin_root))
-    live_items = load_live_iocs(os.getenv("POUNCE_IOC_FEED_URL"))
-    items.extend(live_items)
-    return items
+    global _LAST_INTEL_CONTEXT
+    _LAST_INTEL_CONTEXT = pounce_intel.runtime_feed(plugin_root, os.getenv("POUNCE_IOC_FEED_URL"))
+    feed = _LAST_INTEL_CONTEXT.get("feed", {})
+    items = feed.get("items", []) if isinstance(feed, dict) else []
+    return list(items) if isinstance(items, list) else []
 
 
 def extract_match_value(item: dict[str, Any]) -> dict[str, Any]:
@@ -402,8 +371,10 @@ def make_finding(
     evidence: str,
     source: str,
     artifact: str,
+    count_toward_block: bool = True,
+    metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    finding = {
         "signal_id": signal_id,
         "signal_name": signal_name,
         "category": category,
@@ -412,7 +383,11 @@ def make_finding(
         "evidence": evidence,
         "source": source,
         "artifact": artifact,
+        "count_toward_block": count_toward_block,
     }
+    if metadata:
+        finding["metadata"] = metadata
+    return finding
 
 
 def normalize_artifacts(raw_artifacts: Any) -> list[str]:
@@ -445,6 +420,21 @@ def build_verification_unavailable(
         evidence=detail,
         source=source,
         artifact=artifact,
+        count_toward_block=False,
+    )
+
+
+def build_feed_warning(detail: str, artifact: str) -> dict[str, Any]:
+    return make_finding(
+        signal_id="intel-feed-warning",
+        signal_name="intel_feed_warning",
+        category="verification",
+        severity="medium",
+        verdict_impact="warn",
+        evidence=detail,
+        source="intel_feed",
+        artifact=artifact,
+        count_toward_block=False,
     )
 
 
@@ -456,29 +446,35 @@ def match_package_iocs(
     version: str,
 ) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
-    normalized_package = package_name.strip().lower()
-    normalized_version = version.strip()
-    for item in items:
+    for item in pounce_intel.find_package_matches(
+        items,
+        ecosystem=ecosystem,
+        package_name=package_name,
+        version=version,
+    ):
+        action = str(item.get("action", "warn")).strip().lower()
+        verdict_impact = action if action in {"warn", "block"} else "warn"
         match = extract_match_value(item)
-        if match.get("type") != "package":
-            continue
-        if normalize_ecosystem(match.get("ecosystem")) != ecosystem:
-            continue
-        if str(match.get("name", "")).lower() != normalized_package:
-            continue
-        if str(match.get("version", "")) != normalized_version:
-            continue
-        source = "live_ioc" if item in _LAST_GOOD_IOCS else "seed_ioc"
+        signal_name = "exact_ioc_match" if match.get("type") == "package_exact" else "range_ioc_match"
+        metadata = pounce_intel.indicator_metadata(item)
+        indicators = metadata.get("indicators") if isinstance(metadata, dict) else None
+        evidence = str(item.get("reason", "Exact IOC match."))
+        if isinstance(indicators, list) and indicators:
+            related = ", ".join(str(entry.get("value")) for entry in indicators[:3] if isinstance(entry, dict))
+            if related:
+                evidence += f" Related indicators: {related}."
         findings.append(
             make_finding(
                 signal_id=str(item.get("id", "ioc-match")),
-                signal_name="exact_ioc_match",
+                signal_name=signal_name,
                 category="ioc",
-                severity="critical",
-                verdict_impact="block",
-                evidence=str(item.get("reason", "Exact IOC match.")),
-                source=source,
+                severity="critical" if verdict_impact == "block" else "medium",
+                verdict_impact=verdict_impact,
+                evidence=evidence,
+                source=str(item.get("source", "intel_feed")),
                 artifact=f"{package_name}@{version}" if ecosystem == "npm" else f"{package_name}=={version}",
+                count_toward_block=verdict_impact == "block",
+                metadata=metadata,
             )
         )
     return findings
@@ -486,32 +482,31 @@ def match_package_iocs(
 
 def match_artifact_iocs(items: list[dict[str, Any]], artifacts: list[str]) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
-    lower_artifacts = [(artifact, artifact.lower()) for artifact in artifacts]
-    for item in items:
+    for item, _artifact in pounce_intel.find_artifact_matches(items, artifacts):
+        action = str(item.get("action", "warn")).strip().lower()
+        verdict_impact = action if action in {"warn", "block"} else "warn"
         match = extract_match_value(item)
-        if match.get("type") != "string":
-            continue
-        value = str(match.get("value", "")).strip()
-        if not value:
-            continue
-        needle = value.lower()
-        for artifact, lowered in lower_artifacts:
-            if needle not in lowered:
-                continue
-            source = "live_ioc" if item in _LAST_GOOD_IOCS else "seed_ioc"
-            findings.append(
-                make_finding(
-                    signal_id=str(item.get("id", "ioc-string-match")),
-                    signal_name="artifact_ioc_match",
-                    category="ioc",
-                    severity="critical",
-                    verdict_impact="block",
-                    evidence=str(item.get("reason", "Artifact IOC match.")),
-                    source=source,
-                    artifact=value,
-                )
+        match_type = str(match.get("type", "string")).strip()
+        signal_name = {
+            "domain": "artifact_domain_match",
+            "ip": "artifact_ip_match",
+            "url": "artifact_url_match",
+        }.get(match_type, "artifact_ioc_match")
+        value = str(match.get("value", "")).strip() or str(item.get("id", "ioc-string-match"))
+        findings.append(
+            make_finding(
+                signal_id=str(item.get("id", "ioc-string-match")),
+                signal_name=signal_name,
+                category="ioc",
+                severity="critical" if verdict_impact == "block" else "medium",
+                verdict_impact=verdict_impact,
+                evidence=str(item.get("reason", "Artifact IOC match.")),
+                source=str(item.get("source", "intel_feed")),
+                artifact=value,
+                count_toward_block=verdict_impact == "block",
+                metadata=pounce_intel.indicator_metadata(item),
             )
-            break
+        )
     return findings
 
 
@@ -970,6 +965,7 @@ def build_transitive_analysis_unavailable(artifact: str, detail: str) -> dict[st
         evidence=detail,
         source="package_diff",
         artifact=artifact,
+        count_toward_block=False,
     )
 
 
@@ -1010,6 +1006,29 @@ def check_npm_provenance_regression(
             ),
             source="registry",
             artifact=artifact,
+            count_toward_block=False,
+        )
+    ]
+
+
+def check_npm_missing_provenance(
+    *,
+    artifact: str,
+    target_metadata: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if (target_metadata.get("dist") or {}).get("attestations"):
+        return []
+    return [
+        make_finding(
+            signal_id="npm-missing-provenance",
+            signal_name="npm_missing_provenance",
+            category="provenance",
+            severity="medium",
+            verdict_impact="warn",
+            evidence=f"npm release provenance metadata was missing for {artifact}.",
+            source="registry",
+            artifact=artifact,
+            count_toward_block=False,
         )
     ]
 
@@ -1151,6 +1170,13 @@ def check_npm_release(package_name: str, version: str, workspace: Path | None = 
         findings.extend(check_github_tag(repository, version, artifact))
 
     findings.extend(
+        check_npm_missing_provenance(
+            artifact=artifact,
+            target_metadata=metadata,
+        )
+    )
+
+    findings.extend(
         check_npm_provenance_regression(
             artifact=artifact,
             target_metadata=metadata,
@@ -1220,10 +1246,14 @@ def check_pypi_release(package_name: str, version: str) -> list[dict[str, Any]]:
 def evaluate_verdict(findings: list[dict[str, Any]]) -> str:
     if any(finding["verdict_impact"] == "block" for finding in findings):
         return "block"
-    warn_count = sum(1 for finding in findings if finding["verdict_impact"] == "warn")
+    warn_count = sum(
+        1
+        for finding in findings
+        if finding["verdict_impact"] == "warn" and finding.get("count_toward_block", True)
+    )
     if warn_count >= 2:
         return "block"
-    if warn_count >= 1:
+    if any(finding["verdict_impact"] == "warn" for finding in findings):
         return "warn"
     return "allow"
 
@@ -1231,10 +1261,10 @@ def evaluate_verdict(findings: list[dict[str, Any]]) -> str:
 def summarize_findings(verdict: str, findings: list[dict[str, Any]], artifact: str | None, mode: str) -> str:
     if not findings:
         if mode == "sweep":
-            return "ALLOW: no seeded IOC match or heuristic warning was found in the workspace sweep."
+            return "ALLOW: no threat-intelligence match or heuristic warning was found in the workspace sweep."
         if artifact:
-            return f"ALLOW: no seeded IOC match or heuristic warning was found for {artifact}."
-        return "ALLOW: no seeded IOC match or heuristic warning was found."
+            return f"ALLOW: no threat-intelligence match or heuristic warning was found for {artifact}."
+        return "ALLOW: no threat-intelligence match or heuristic warning was found."
 
     highlights = "; ".join(truncate(finding["evidence"], 120) for finding in findings[:3])
     subject = artifact or ("workspace sweep" if mode == "sweep" else "requested artifact")
@@ -1748,6 +1778,76 @@ def mechanism_contexts_for_path(path: Path) -> set[str]:
     return set()
 
 
+def package_name_from_lock_path(path_key: str) -> str | None:
+    if "node_modules/" not in path_key:
+        return None
+    return path_key.rsplit("node_modules/", 1)[-1] or None
+
+
+def collect_npm_lock_versions(lock_payload: dict[str, Any]) -> list[tuple[str, str]]:
+    matches: list[tuple[str, str]] = []
+    packages = lock_payload.get("packages")
+    if isinstance(packages, dict):
+        for path_key, value in packages.items():
+            if not isinstance(value, dict):
+                continue
+            name = package_name_from_lock_path(str(path_key))
+            version = str(value.get("version", "")).strip()
+            if name and version:
+                matches.append((name, version))
+    dependencies = lock_payload.get("dependencies")
+    if isinstance(dependencies, dict):
+        queue = list(dependencies.items())
+        while queue:
+            dependency_name, value = queue.pop(0)
+            if not isinstance(value, dict):
+                continue
+            version = str(value.get("version", "")).strip()
+            if dependency_name and version:
+                matches.append((str(dependency_name), version))
+            nested = value.get("dependencies")
+            if isinstance(nested, dict):
+                queue.extend(nested.items())
+    return matches
+
+
+def collect_workspace_exact_packages(workspace: Path) -> list[tuple[str, str, str, str]]:
+    packages: list[tuple[str, str, str, str]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    snapshot = collect_dependency_snapshot(workspace)
+    for path, entry in (snapshot.get("files") or {}).items():
+        if not isinstance(entry, dict) or entry.get("lockfile"):
+            continue
+        ecosystem = str(entry.get("ecosystem", "")).strip()
+        dependencies = entry.get("dependencies") or {}
+        if not isinstance(dependencies, dict):
+            continue
+        for key, spec in dependencies.items():
+            name = dependency_entry_name(str(key))
+            if ecosystem == "npm":
+                _, exact_spec, spec_kind = parse_npm_spec(f"{name}@{spec}")
+                normalized_name = name
+            else:
+                _, exact_spec, spec_kind = parse_python_spec(f"{name}{spec}")
+                normalized_name = name.split("[", 1)[0]
+            if spec_kind != "exact" or not exact_spec:
+                continue
+            item = (ecosystem, normalized_name, exact_spec, path)
+            if item not in seen:
+                seen.add(item)
+                packages.append(item)
+
+    lock_payload = read_workspace_npm_lock(workspace)
+    if lock_payload:
+        lock_path, payload = lock_payload
+        for name, version in collect_npm_lock_versions(payload):
+            item = ("npm", name, version, str(lock_path.relative_to(workspace)))
+            if item not in seen:
+                seen.add(item)
+                packages.append(item)
+    return packages
+
+
 def scan_workspace(workspace: Path, indicators: list[dict[str, Any]]) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     if not workspace.exists():
@@ -1796,6 +1896,16 @@ def scan_workspace(workspace: Path, indicators: list[dict[str, Any]]) -> list[di
                 finding["evidence"] += f" File: {relative_path}."
                 findings.append(finding)
 
+    for ecosystem, package_name, version, origin_path in collect_workspace_exact_packages(workspace):
+        for finding in match_package_iocs(
+            indicators,
+            ecosystem=ecosystem,
+            package_name=package_name,
+            version=version,
+        ):
+            finding["evidence"] += f" Observed in {origin_path}."
+            findings.append(finding)
+
     if truncated:
         findings.append(
             make_finding(
@@ -1810,6 +1920,7 @@ def scan_workspace(workspace: Path, indicators: list[dict[str, Any]]) -> list[di
                 ),
                 source="install_scan",
                 artifact=str(workspace),
+                count_toward_block=False,
             )
         )
 
@@ -1842,6 +1953,7 @@ def vet_payload(payload: dict[str, Any], plugin_root: Path, *, write_stamp_enabl
         artifacts.append(reason)
 
     indicators = collect_iocs(plugin_root)
+    intel_warnings = list(_LAST_INTEL_CONTEXT.get("warnings", [])) if isinstance(_LAST_INTEL_CONTEXT, dict) else []
     findings: list[dict[str, Any]] = []
     recommended_version: str | None = None
     recommended_command: str | None = None
@@ -1866,6 +1978,7 @@ def vet_payload(payload: dict[str, Any], plugin_root: Path, *, write_stamp_enabl
 
     if mode == "release":
         if package_name and version and ecosystem in {"npm", "pypi"}:
+            artifact = f"{package_name}@{version}" if ecosystem == "npm" else f"{package_name}=={version}"
             findings.extend(
                 match_package_iocs(
                     indicators,
@@ -1874,7 +1987,19 @@ def vet_payload(payload: dict[str, Any], plugin_root: Path, *, write_stamp_enabl
                     version=version,
                 )
             )
-            artifact = f"{package_name}@{version}" if ecosystem == "npm" else f"{package_name}=={version}"
+            try:
+                osv_items = pounce_intel.on_demand_osv_items(ecosystem, package_name, version)
+            except pounce_intel.IntelUnavailable as exc:
+                findings.append(build_verification_unavailable(source="osv", artifact=artifact, detail=str(exc)))
+            else:
+                findings.extend(
+                    match_package_iocs(
+                        osv_items,
+                        ecosystem=ecosystem,
+                        package_name=package_name,
+                        version=version,
+                    )
+                )
             if ecosystem == "npm":
                 findings.extend(check_npm_release(package_name, version, workspace))
                 try:
@@ -1921,11 +2046,25 @@ def vet_payload(payload: dict[str, Any], plugin_root: Path, *, write_stamp_enabl
         else:
             findings.extend(scan_workspace(workspace, indicators))
 
+    for warning in intel_warnings:
+        if isinstance(warning, dict):
+            findings.append(build_feed_warning(str(warning.get("detail", "")).strip(), artifact or "intel-feed"))
+
     if artifacts:
         findings.extend(match_artifact_iocs(indicators, artifacts))
         findings.extend(
             scan_mechanisms("\n".join(artifacts), source="install_scan", artifact=artifact or "artifacts")
         )
+
+    deduped_findings: list[dict[str, Any]] = []
+    seen_findings: set[tuple[str, str, str]] = set()
+    for finding in findings:
+        key = (str(finding.get("signal_id")), str(finding.get("artifact")), str(finding.get("source")))
+        if key in seen_findings:
+            continue
+        seen_findings.add(key)
+        deduped_findings.append(finding)
+    findings = deduped_findings
 
     verdict = evaluate_verdict(findings)
     checked_at = iso_now()

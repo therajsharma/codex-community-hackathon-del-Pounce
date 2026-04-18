@@ -21,6 +21,10 @@ Use `mode: "sweep"` for:
 - incident response after a public package compromise
 - checking a workspace for IOC strings or install-time execution mechanisms
 
+Refresh the local intelligence feed when you need fresher malware data:
+- `python3 plugins/pounce/scripts/pounce_feed.py sync`
+- `python3 plugins/pounce/scripts/pounce_feed.py export --output /tmp/pounce-feed.json`
+
 ## Inputs
 
 For release vetting, prefer:
@@ -41,6 +45,7 @@ For repository sweeps, pass:
 - Prefer exact versions. Do not recommend floating ranges when Pounce is in the loop.
 - If `pounce.vet` returns `block`, do not write or install that dependency. Propose a safer exact version or no dependency.
 - If `pounce.vet` returns `warn`, explain the warning and propose the safest exact alternative before proceeding.
+- Confirmed malicious-package intelligence blocks by default. Warning-only vulnerability or provenance signals should be explained, not described as confirmed malware.
 - If verification is unavailable, treat the result as a manual review gate rather than a green light.
 
 ## Response style

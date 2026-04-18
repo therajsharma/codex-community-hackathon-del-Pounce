@@ -18,7 +18,9 @@ from pounce_runtime import (  # noqa: E402
     assess_dependency_guard,
     agents_block_text,
     check_npm_release,
+    evaluate_verdict,
     extract_dependency_commands,
+    match_package_iocs,
     record_dependency_guard_allowlist,
     replace_managed_block,
     snapshot_dependency_guard,
@@ -277,8 +279,10 @@ class PounceRuntimeTests(unittest.TestCase):
             findings = check_npm_release("demo", "1.1.0")
         signal_names = {finding["signal_name"] for finding in findings}
         self.assertIn("npm_provenance_regression", signal_names)
+        self.assertIn("npm_missing_provenance", signal_names)
+        self.assertEqual(evaluate_verdict(findings), "warn")
 
-    def test_npm_missing_attestations_without_regression_is_silent(self) -> None:
+    def test_npm_missing_attestations_without_regression_warns_only(self) -> None:
         package_index = {
             "versions": {
                 "1.0.0": {"dist": {}},
@@ -293,6 +297,77 @@ class PounceRuntimeTests(unittest.TestCase):
             findings = check_npm_release("demo", "1.1.0")
         signal_names = {finding["signal_name"] for finding in findings}
         self.assertNotIn("npm_provenance_regression", signal_names)
+        self.assertIn("npm_missing_provenance", signal_names)
+        self.assertEqual(evaluate_verdict(findings), "warn")
+
+    def test_warn_action_package_match_does_not_block(self) -> None:
+        findings = match_package_iocs(
+            [
+                {
+                    "id": "warn-demo",
+                    "kind": "vulnerability",
+                    "match": {
+                        "type": "package_exact",
+                        "ecosystem": "npm",
+                        "name": "demo",
+                        "version": "1.2.3",
+                    },
+                    "action": "warn",
+                    "confidence": 0.8,
+                    "reason": "Warning-only package intelligence.",
+                    "source": "osv",
+                    "source_refs": [{"kind": "osv", "id": "GHSA-demo"}],
+                    "published_at": "2026-04-10T00:00:00Z",
+                    "modified_at": "2026-04-10T00:00:00Z",
+                    "first_seen": "2026-04-10T00:00:00Z",
+                    "last_seen": "2026-04-10T00:00:00Z",
+                }
+            ],
+            ecosystem="npm",
+            package_name="demo",
+            version="1.2.3",
+        )
+        self.assertEqual(findings[0]["verdict_impact"], "warn")
+        self.assertEqual(evaluate_verdict(findings), "warn")
+
+    def test_on_demand_osv_malware_blocks_release_vetting(self) -> None:
+        malicious_item = {
+            "id": "MAL-2026-1:npm:demo:package_exact:1.2.3",
+            "kind": "malicious_package",
+            "match": {"type": "package_exact", "ecosystem": "npm", "name": "demo", "version": "1.2.3"},
+            "action": "block",
+            "confidence": 1.0,
+            "reason": "Known malicious package.",
+            "source": "osv",
+            "source_refs": [{"kind": "osv", "id": "MAL-2026-1"}],
+            "published_at": "2026-04-10T00:00:00Z",
+            "modified_at": "2026-04-10T00:00:00Z",
+            "first_seen": "2026-04-10T00:00:00Z",
+            "last_seen": "2026-04-10T00:00:00Z",
+            "metadata": {"indicators": [{"match_type": "url", "value": "https://evil.example/install.sh"}]},
+        }
+        package_index = {
+            "versions": {"1.2.3": {"dist": {"attestations": {"url": "https://example.test/attest"}}, "dependencies": {}}},
+            "time": {"1.2.3": "2026-04-10T00:00:00Z"},
+        }
+        with (
+            mock.patch("pounce_runtime.collect_iocs", return_value=[]),
+            mock.patch("pounce_runtime.pounce_intel.on_demand_osv_items", return_value=[malicious_item]),
+            mock.patch("pounce_runtime.check_npm_release", return_value=[]),
+            mock.patch("pounce_runtime.load_npm_package_index", return_value=package_index),
+        ):
+            result = vet_payload(
+                {
+                    "mode": "release",
+                    "ecosystem": "npm",
+                    "package_name": "demo",
+                    "version": "1.2.3",
+                },
+                PLUGIN_ROOT,
+            )
+        self.assertEqual(result["verdict"], "block")
+        matched = next(item for item in result["findings"] if item["signal_name"] == "exact_ioc_match")
+        self.assertIn("https://evil.example/install.sh", matched["evidence"])
 
     def test_workspace_baseline_version_beats_registry_previous_release(self) -> None:
         package_index = {
