@@ -295,11 +295,14 @@ def run_mcp_smoke() -> dict[str, Any]:
         and all(key in dashboard_structured for key in ("generated_at", "workspace", "feed", "recent_verdicts"))
         and "Pounce Dashboard" in dashboard_text
     )
-    detail = dashboard_structured.get("workspace", {}).get("protection_status")
+    detail = (
+        f"Dashboard returned `{dashboard_structured.get('workspace', {}).get('protection_status', 'unknown')}` "
+        f"workspace status and `{dashboard_structured.get('feed', {}).get('trust_state', 'unknown')}` feed trust."
+    )
     return make_check(
         "MCP server lists and executes pounce.vet and pounce.dashboard",
         passed,
-        detail or vet_structured.get("summary", "MCP tool calls did not return the expected data."),
+        detail if passed else vet_structured.get("summary", "MCP tool calls did not return the expected data."),
     )
 
 

@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Pounce Dashboard</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f5f1ea;
+        --panel: #fffdfa;
+        --panel-border: #d6c8ba;
+        --text: #231f1b;
+        --muted: #5e554c;
+        --accent: #c2410c;
+        --good: #0f766e;
+        --warn: #92400e;
+        --shadow: 0 18px 48px rgba(35, 31, 27, 0.08);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family:
+          Inter,
+          ui-sans-serif,
+          system-ui,
+          -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          sans-serif;
+        background:
+          radial-gradient(circle at top left, rgba(194, 65, 12, 0.1), transparent 30%),
+          linear-gradient(180deg, #f9f5ef 0%, var(--bg) 100%);
+        color: var(--text);
+      }
+
+      .frame {
+        width: 1280px;
+        margin: 0 auto;
+        padding: 40px 32px;
+      }
+
+      .window {
+        background: var(--panel);
+        border: 1px solid var(--panel-border);
+        border-radius: 8px;
+        box-shadow: var(--shadow);
+        overflow: hidden;
+      }
+
+      .titlebar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        padding: 16px 20px;
+        border-bottom: 1px solid rgba(214, 200, 186, 0.9);
+        background: rgba(255, 253, 250, 0.95);
+      }
+
+      .traffic {
+        display: flex;
+        gap: 8px;
+      }
+
+      .traffic span {
+        width: 12px;
+        height: 12px;
+        border-radius: 999px;
+        display: inline-block;
+      }
+
+      .traffic span:nth-child(1) { background: #ef4444; }
+      .traffic span:nth-child(2) { background: #f59e0b; }
+      .traffic span:nth-child(3) { background: #10b981; }
+
+      .title {
+        font-size: 14px;
+        font-weight: 600;
+        color: var(--muted);
+      }
+
+      .content {
+        padding: 28px;
+        display: grid;
+        grid-template-columns: 1.1fr 0.9fr;
+        gap: 20px;
+      }
+
+      .panel {
+        border: 1px solid rgba(214, 200, 186, 0.9);
+        border-radius: 8px;
+        padding: 20px;
+        background: #fffdfb;
+      }
+
+      .panel h1,
+      .panel h2 {
+        margin: 0 0 14px;
+        letter-spacing: 0;
+      }
+
+      .panel h1 {
+        font-size: 26px;
+        line-height: 1.1;
+      }
+
+      .panel h2 {
+        font-size: 16px;
+        color: var(--muted);
+      }
+
+      .meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-bottom: 18px;
+      }
+
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 7px 10px;
+        border-radius: 8px;
+        background: rgba(194, 65, 12, 0.08);
+        color: var(--accent);
+        font-size: 13px;
+        font-weight: 600;
+      }
+
+      .badge.good {
+        background: rgba(15, 118, 110, 0.1);
+        color: var(--good);
+      }
+
+      ul {
+        margin: 0;
+        padding-left: 18px;
+        color: var(--muted);
+      }
+
+      li {
+        margin: 0 0 10px;
+        line-height: 1.5;
+      }
+
+      code {
+        font-family:
+          "SFMono-Regular",
+          ui-monospace,
+          SFMono-Regular,
+          Menlo,
+          monospace;
+        font-size: 0.94em;
+        background: rgba(35, 31, 27, 0.05);
+        border-radius: 6px;
+        padding: 2px 6px;
+        color: var(--text);
+      }
+
+      .verdicts {
+        display: grid;
+        gap: 12px;
+      }
+
+      .verdict {
+        border: 1px solid rgba(214, 200, 186, 0.9);
+        border-radius: 8px;
+        padding: 14px;
+        background: rgba(255, 255, 255, 0.9);
+      }
+
+      .verdict-head {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 8px;
+        font-size: 13px;
+      }
+
+      .status {
+        font-weight: 700;
+        color: var(--warn);
+      }
+
+      .status.block {
+        color: #b91c1c;
+      }
+
+      .status.allow {
+        color: var(--good);
+      }
+
+      .verdict p {
+        margin: 0;
+        font-size: 14px;
+        line-height: 1.45;
+        color: var(--muted);
+      }
+
+      .foot {
+        margin-top: 14px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="frame">
+      <div class="window">
+        <div class="titlebar">
+          <div class="traffic"><span></span><span></span><span></span></div>
+          <div class="title">Pounce Dashboard</div>
+          <div class="title">workspace snapshot</div>
+        </div>
+        <div class="content">
+          <section class="panel">
+            <h1>Pounce Dashboard</h1>
+            <div class="meta">
+              <span class="badge good">Workspace: protected</span>
+              <span class="badge">Feed: bundled_seed</span>
+              <span class="badge">Active items: 5</span>
+            </div>
+
+            <h2>Workspace</h2>
+            <ul>
+              <li>Protection status: <code>protected</code></li>
+              <li>Managed policy: present</li>
+              <li>Hooks: 3/3 configured, enabled in <code>.codex/config.toml</code></li>
+              <li>Latest guard snapshot: recorded for the current workspace</li>
+              <li>Last sweep: <code>ALLOW</code> on the demo repository</li>
+            </ul>
+
+            <h2 style="margin-top: 18px;">Feed</h2>
+            <ul>
+              <li>Selected source: <code>seed</code></li>
+              <li>Trust state: <code>bundled_seed</code></li>
+              <li>Transport policy: HTTPS-only hosted feeds, redirects disabled, 5 MiB response cap</li>
+              <li>Warnings: none</li>
+            </ul>
+
+            <div class="foot">Rendered from the current Pounce dashboard surface for hackathon submission assets.</div>
+          </section>
+
+          <section class="panel">
+            <h2>Recent Verdicts</h2>
+            <div class="verdicts">
+              <article class="verdict">
+                <div class="verdict-head">
+                  <span><code>2026-04-18T06:01:05Z</code></span>
+                  <span class="status">WARN</span>
+                </div>
+                <p><strong>axios@1.15.0</strong><br />npm install-time script matched <code>prepare</code>.</p>
+              </article>
+
+              <article class="verdict">
+                <div class="verdict-head">
+                  <span><code>2026-04-18T05:39:30Z</code></span>
+                  <span class="status block">BLOCK</span>
+                </div>
+                <p><strong>plain-crypto-js@4.2.1</strong><br />Known malicious dependency from the Axios supply-chain compromise.</p>
+              </article>
+
+              <article class="verdict">
+                <div class="verdict-head">
+                  <span><code>2026-04-17T14:01:40Z</code></span>
+                  <span class="status allow">ALLOW</span>
+                </div>
+                <p><strong>workspace sweep</strong><br />No seeded IOC match or heuristic warning was found in the workspace sweep.</p>
+              </article>
+            </div>
+          </section>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

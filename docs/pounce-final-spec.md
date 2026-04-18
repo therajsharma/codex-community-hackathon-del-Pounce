@@ -1,6 +1,6 @@
 # Pounce
 
-Pounce is an agent-native dependency tripwire for Codex.
+Pounce is an agent-native dependency security layer for Codex.
 
 ## One-line pitch
 
@@ -24,6 +24,8 @@ Pounce adds four layers of protection to the Codex workflow:
 4. refreshable threat-intelligence feeds with bundled fallback data
 
 The visibility surface for that workflow is `pounce.dashboard`, which exposes workspace protection status, feed freshness and source selection, and recent verdicts.
+
+Hosted feeds are bounded by an explicit transport policy: HTTPS only, redirects disabled, and a 5 MiB response cap. When verification is degraded, `pounce.vet` stays usable but marks the result for manual review while hook-enforced installs fail closed.
 
 ## Current feature set
 

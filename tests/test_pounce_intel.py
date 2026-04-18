@@ -5,6 +5,7 @@ import unittest
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest import mock
+from urllib.error import HTTPError
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -17,6 +18,31 @@ import pounce_intel  # noqa: E402
 
 
 class PounceIntelTests(unittest.TestCase):
+    class _FakeResponse:
+        def __init__(self, *, chunks: list[bytes] | None = None, headers: dict[str, str] | None = None) -> None:
+            self._chunks = list(chunks or [])
+            self.headers = headers or {}
+
+        def __enter__(self) -> "PounceIntelTests._FakeResponse":
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+            return False
+
+        def read(self, _size: int = -1) -> bytes:
+            if self._chunks:
+                return self._chunks.pop(0)
+            return b""
+
+    class _FakeOpener:
+        def __init__(self, result: object) -> None:
+            self._result = result
+
+        def open(self, *_args: object, **_kwargs: object) -> object:
+            if isinstance(self._result, Exception):
+                raise self._result
+            return self._result
+
     def test_normalize_legacy_seed_payload_promotes_exact_package_and_string_matches(self) -> None:
         payload = {
             "items": [
@@ -218,6 +244,59 @@ class PounceIntelTests(unittest.TestCase):
 
         self.assertEqual(context["selected_from"], "remote")
         self.assertTrue(any(item["code"] == "feed_stale" for item in context["warnings"]))
+
+    def test_load_remote_feed_rejects_non_https_urls(self) -> None:
+        with self.assertRaisesRegex(pounce_intel.IntelUnavailable, "https URL"):
+            pounce_intel.load_remote_feed("http://feed.example/intel.json")
+
+    def test_load_remote_feed_rejects_malformed_urls(self) -> None:
+        with self.assertRaisesRegex(pounce_intel.IntelUnavailable, "https URL"):
+            pounce_intel.load_remote_feed("not-a-url")
+
+    def test_load_remote_feed_rejects_redirects(self) -> None:
+        redirect_error = HTTPError("https://feed.example/intel.json", 302, "Found", {}, None)
+        with mock.patch("pounce_intel.build_opener", return_value=self._FakeOpener(redirect_error)):
+            with self.assertRaisesRegex(pounce_intel.IntelUnavailable, "redirects are not allowed"):
+                pounce_intel.load_remote_feed("https://feed.example/intel.json")
+
+    def test_load_remote_feed_rejects_oversized_responses(self) -> None:
+        oversized = self._FakeResponse(
+            headers={"Content-Length": str(pounce_intel.MAX_HTTP_RESPONSE_BYTES + 1)},
+        )
+        with mock.patch("pounce_intel.build_opener", return_value=self._FakeOpener(oversized)):
+            with self.assertRaisesRegex(pounce_intel.IntelUnavailable, "response limit"):
+                pounce_intel.load_remote_feed("https://feed.example/intel.json")
+
+    def test_request_json_uses_generic_opener(self) -> None:
+        response = self._FakeResponse(chunks=[b'{"ok": true}'])
+        with mock.patch("pounce_intel.build_opener", return_value=self._FakeOpener(response)) as mock_build_opener:
+            payload, headers = pounce_intel.request_json("https://api.example/security")
+
+        self.assertEqual(payload, {"ok": True})
+        self.assertEqual(headers, {})
+        mock_build_opener.assert_called_once_with()
+
+    def test_request_text_allows_large_responses_without_explicit_limit(self) -> None:
+        oversized = self._FakeResponse(
+            chunks=[b"large trusted upstream response"],
+            headers={"Content-Length": str(pounce_intel.MAX_HTTP_RESPONSE_BYTES + 1)},
+        )
+        with mock.patch("pounce_intel.build_opener", return_value=self._FakeOpener(oversized)):
+            response = pounce_intel.request_text("https://api.example/security")
+
+        self.assertEqual(response.text, "large trusted upstream response")
+
+    def test_osv_recent_malware_ids_is_not_bound_to_hosted_feed_limit(self) -> None:
+        csv_payload = "2026-04-18T00:00:00Z,https://osv.dev/MAL-2026-1\n"
+        oversized = self._FakeResponse(
+            chunks=[csv_payload.encode("utf-8")],
+            headers={"Content-Length": str(pounce_intel.MAX_HTTP_RESPONSE_BYTES + 1)},
+        )
+        with mock.patch("pounce_intel.build_opener", return_value=self._FakeOpener(oversized)):
+            advisory_ids, newest_modified = pounce_intel.osv_recent_malware_ids(None)
+
+        self.assertEqual(advisory_ids, ["MAL-2026-1"])
+        self.assertEqual(newest_modified, "2026-04-18T00:00:00Z")
 
     def test_remote_cache_does_not_pollute_sync_or_export(self) -> None:
         local_feed = {

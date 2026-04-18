@@ -15,7 +15,7 @@ The event is aimed at developers who are already comfortable shipping production
 
 ## Fast pitch
 
-Pounce is a security tripwire for Codex. Before an agent adds or installs dependencies, Pounce can vet the exact release, block obviously risky shell installs, rewrite non-exact commands into exact ones, sweep a workspace for known malicious indicators, and leave a local audit trail so the dependency story is explainable.
+Pounce is a security guardrail for Codex. Before an agent adds or installs dependencies, Pounce can vet the exact release, block obviously risky shell installs, rewrite non-exact commands into exact ones, sweep a workspace for known malicious indicators, and leave a local audit trail so the dependency story is explainable.
 
 ## Five-minute demo flow
 
@@ -77,7 +77,7 @@ python3 plugins/pounce/scripts/pounce_feed.py sync
 
 ## Fallback plan if network is unreliable
 
-The demo path is intentionally deterministic and relies on bundled threat intelligence where possible. That means you can still show the core value even if live feed refresh is skipped. The dashboard will also fall back through remote cache, local sync cache, and finally seed data.
+The demo path is intentionally deterministic and relies on bundled threat intelligence where possible. That means you can still show the core value even if live feed refresh is skipped. The dashboard will also fall back through remote cache, local sync cache, and finally seed data. Hosted feeds are bounded to HTTPS, no redirects, and a 5 MiB response cap, so feed failures degrade safely instead of silently weakening the policy boundary.
 
 ## What judges should remember
 

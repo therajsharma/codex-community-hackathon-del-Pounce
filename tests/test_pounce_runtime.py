@@ -25,6 +25,7 @@ from pounce_runtime import (  # noqa: E402
     ensure_workspace_config_toml,
     evaluate_verdict,
     extract_dependency_commands,
+    load_npm_view_dependencies,
     match_package_iocs,
     record_dependency_guard_allowlist,
     render_dashboard_markdown,
@@ -270,6 +271,66 @@ class PounceRuntimeTests(unittest.TestCase):
             )
             assessment = assess_dependency_guard(workspace, "turn-1")
         self.assertFalse(assessment["block"])
+
+    def test_guard_blocks_when_snapshot_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            (workspace / "package.json").write_text(json.dumps({"dependencies": {"demo": "1.0.0"}}), encoding="utf-8")
+            assessment = assess_dependency_guard(workspace, "missing-turn")
+        self.assertTrue(assessment["block"])
+        self.assertEqual(assessment["reason_code"], "guard_state_missing")
+
+    def test_invalid_package_name_returns_validation_finding(self) -> None:
+        with mock.patch("pounce_runtime.collect_iocs", return_value=[]):
+            result = vet_payload(
+                {
+                    "mode": "release",
+                    "ecosystem": "npm",
+                    "package_name": "-demo",
+                    "version": "1.2.3",
+                },
+                PLUGIN_ROOT,
+                write_stamp_enabled=False,
+            )
+        self.assertEqual(result["verdict"], "warn")
+        self.assertTrue(any(item["signal_name"] == "invalid_input" for item in result["findings"]))
+
+    def test_verification_outage_marks_release_for_manual_review(self) -> None:
+        with (
+            mock.patch("pounce_runtime.collect_iocs", return_value=[]),
+            mock.patch(
+                "pounce_runtime.pounce_intel.on_demand_osv_items",
+                side_effect=pounce_intel.IntelUnavailable("osv unavailable"),
+            ),
+            mock.patch("pounce_runtime.check_npm_release", return_value=[]),
+            mock.patch("pounce_runtime.load_npm_package_index", return_value={"versions": {}, "time": {}}),
+        ):
+            result = vet_payload(
+                {
+                    "mode": "release",
+                    "ecosystem": "npm",
+                    "package_name": "demo",
+                    "version": "1.2.3",
+                },
+                PLUGIN_ROOT,
+                write_stamp_enabled=False,
+            )
+        self.assertEqual(result["verification_status"], "degraded")
+        self.assertTrue(result["manual_review_required"])
+
+    def test_npm_view_uses_double_dash_separator(self) -> None:
+        completed = mock.Mock(returncode=0, stdout="{}", stderr="")
+        with mock.patch("pounce_runtime.subprocess.run", return_value=completed) as run_mock:
+            dependencies = load_npm_view_dependencies("demo-invoke", "1.2.3")
+        self.assertEqual(dependencies, {})
+        self.assertEqual(
+            run_mock.call_args.args[0],
+            ["npm", "view", "--", "demo-invoke@1.2.3", "dependencies", "--json"],
+        )
+
+    def test_workspace_write_rejects_home_directory(self) -> None:
+        with self.assertRaises(ValueError):
+            snapshot_dependency_guard(Path.home(), "turn-1")
 
     def test_npm_provenance_regression_warns_only_when_baseline_had_attestations(self) -> None:
         package_index = {
@@ -546,6 +607,7 @@ class PounceRuntimeTests(unittest.TestCase):
         self.assertTrue(snapshot["workspace"]["managed_policy"])
         self.assertTrue(snapshot["workspace"]["hooks_configured"]["all_events"])
         self.assertTrue(snapshot["workspace"]["hooks_enabled"])
+        self.assertIsNone(snapshot["workspace"]["degraded_reason"])
         self.assertEqual(snapshot["workspace"]["dependency_file_count"], 1)
         self.assertIsNotNone(snapshot["workspace"]["latest_guard_snapshot"])
         self.assertEqual(snapshot["workspace"]["last_sweep"]["mode"], "sweep")
@@ -562,6 +624,7 @@ class PounceRuntimeTests(unittest.TestCase):
         self.assertTrue(snapshot["workspace"]["managed_policy"])
         self.assertFalse(snapshot["workspace"]["hooks_configured"]["all_events"])
         self.assertFalse(snapshot["workspace"]["hooks_enabled"])
+        self.assertIn("Workspace hook configuration is incomplete.", snapshot["workspace"]["degraded_reason"])
 
     def test_dashboard_uses_unavailable_workspace_state_when_no_workspace_can_be_resolved(self) -> None:
         with tempfile.TemporaryDirectory() as state_dir, mock.patch.dict(
@@ -576,6 +639,7 @@ class PounceRuntimeTests(unittest.TestCase):
         self.assertEqual(snapshot["workspace"]["protection_status"], "unavailable")
         self.assertEqual(snapshot["recent_verdicts"], [])
         self.assertEqual(snapshot["feed"]["selected_from"], "seed")
+        self.assertEqual(snapshot["feed"]["trust_state"], "bundled_seed")
         self.assertIn("No workspace was resolved", markdown)
         self.assertIn("No recent verdicts", markdown)
 
@@ -664,12 +728,17 @@ class PounceRuntimeTests(unittest.TestCase):
                 seed_snapshot = build_dashboard_snapshot({"workspace": str(PLUGIN_ROOT)}, PLUGIN_ROOT, current_workspace=PLUGIN_ROOT)
 
         self.assertEqual(remote_snapshot["feed"]["selected_from"], "remote")
+        self.assertEqual(remote_snapshot["feed"]["trust_state"], "hosted_feed_unverified")
+        self.assertIn("https-only", remote_snapshot["feed"]["transport_policy"])
         self.assertTrue(any(item["code"] == "feed_stale" for item in remote_snapshot["feed"]["warnings"]))
         self.assertEqual(remote_cache_snapshot["feed"]["selected_from"], "remote_cache")
+        self.assertEqual(remote_cache_snapshot["feed"]["trust_state"], "hosted_feed_cache_unverified")
         self.assertTrue(any(item["code"] == "feed_refresh_failed" for item in remote_cache_snapshot["feed"]["warnings"]))
         self.assertEqual(local_snapshot["feed"]["selected_from"], "local_sync_cache")
+        self.assertEqual(local_snapshot["feed"]["trust_state"], "local_sync_cache")
         self.assertTrue(any(item["code"] == "feed_refresh_failed" for item in local_snapshot["feed"]["warnings"]))
         self.assertEqual(seed_snapshot["feed"]["selected_from"], "seed")
+        self.assertEqual(seed_snapshot["feed"]["trust_state"], "bundled_seed")
 
     def test_dashboard_recent_verdicts_use_checked_at_sort_subjects_and_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

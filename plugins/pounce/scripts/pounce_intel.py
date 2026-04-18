@@ -12,13 +12,14 @@ from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlencode, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 FEED_SCHEMA_VERSION = "1.0"
 DEFAULT_STATE_DIR = Path.home() / ".codex" / "pounce"
 DEFAULT_FEED_STALE_AFTER_HOURS = 6
 HTTP_USER_AGENT = "pounce-local-plugin"
+MAX_HTTP_RESPONSE_BYTES = 5 * 1024 * 1024
 GITHUB_API_ROOT = "https://api.github.com"
 OSV_API_ROOT = "https://api.osv.dev"
 OSV_EXPORT_ROOT = "https://storage.googleapis.com/osv-vulnerabilities"
@@ -52,6 +53,19 @@ class IntelUnavailable(Exception):
 class HttpResponse:
     text: str
     headers: dict[str, str]
+
+
+class NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> Request | None:
+        raise HTTPError(req.full_url, code, "Redirects are not allowed.", headers, fp)
 
 
 def now_utc() -> datetime:
@@ -161,6 +175,48 @@ def github_token() -> str | None:
     return None
 
 
+def validate_https_url(url: str, *, purpose: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme.lower() != "https":
+        raise IntelUnavailable(f"{purpose} must use an https URL.")
+    if not parsed.netloc:
+        raise IntelUnavailable(f"{purpose} must include a valid host.")
+    if parsed.username or parsed.password:
+        raise IntelUnavailable(f"{purpose} must not include credentials.")
+    if parsed.fragment:
+        raise IntelUnavailable(f"{purpose} must not include a fragment.")
+
+
+def response_text(response: Any, *, url: str, max_response_bytes: int | None = None) -> str:
+    content_length = response.headers.get("Content-Length")
+    if max_response_bytes is not None and content_length:
+        try:
+            parsed_length = int(content_length)
+        except ValueError:
+            parsed_length = None
+        else:
+            if parsed_length > max_response_bytes:
+                raise IntelUnavailable(
+                    f"{url} exceeded the {max_response_bytes} byte response limit."
+                )
+
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = response.read(64 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if max_response_bytes is not None and total > max_response_bytes:
+            raise IntelUnavailable(f"{url} exceeded the {max_response_bytes} byte response limit.")
+        chunks.append(chunk)
+
+    try:
+        return b"".join(chunks).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise IntelUnavailable(f"{url} returned a non-UTF-8 response.") from exc
+
+
 def request_text(
     url: str,
     *,
@@ -168,6 +224,9 @@ def request_text(
     data: bytes | None = None,
     method: str | None = None,
     timeout: int = 20,
+    purpose: str = "Remote request",
+    max_response_bytes: int | None = None,
+    forbid_redirects: bool = False,
 ) -> HttpResponse:
     request = Request(
         url,
@@ -180,15 +239,39 @@ def request_text(
         },
     )
     try:
-        with urlopen(request, timeout=timeout) as response:
-            text = response.read().decode("utf-8")
+        opener = build_opener(NoRedirectHandler) if forbid_redirects else build_opener()
+        with opener.open(request, timeout=timeout) as response:
+            text = response_text(response, url=url, max_response_bytes=max_response_bytes)
             response_headers = {key: value for key, value in response.headers.items()}
     except HTTPError as exc:
+        if forbid_redirects and 300 <= exc.code < 400:
+            raise IntelUnavailable(f"{purpose} redirects are not allowed.") from exc
         detail = exc.read().decode("utf-8", errors="replace") if exc.fp is not None else ""
         raise IntelUnavailable(f"{url} returned HTTP {exc.code}: {detail or exc.reason}") from exc
     except URLError as exc:
         raise IntelUnavailable(f"{url} could not be reached: {exc.reason}") from exc
     return HttpResponse(text=text, headers=response_headers)
+
+
+def request_hosted_feed_text(
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    data: bytes | None = None,
+    method: str | None = None,
+    timeout: int = 20,
+) -> HttpResponse:
+    validate_https_url(url, purpose="Hosted feed URL")
+    return request_text(
+        url,
+        headers=headers,
+        data=data,
+        method=method,
+        timeout=timeout,
+        purpose="Hosted feed URL",
+        max_response_bytes=MAX_HTTP_RESPONSE_BYTES,
+        forbid_redirects=True,
+    )
 
 
 def request_json(
@@ -203,7 +286,7 @@ def request_json(
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
         headers = {"Content-Type": "application/json", **(headers or {})}
-    response = request_text(url, headers=headers, data=data, method=method, timeout=timeout)
+    response = request_text(url, headers=headers, data=data, method=method, timeout=timeout, purpose="Remote API request")
     try:
         parsed = json.loads(response.text)
     except json.JSONDecodeError as exc:
@@ -1241,7 +1324,10 @@ def export_intelligence_feed(*, output_path: str | None = None) -> dict[str, Any
 
 
 def load_remote_feed(url: str) -> dict[str, Any]:
-    response = request_text(url, headers={"Accept": "application/json"})
+    response = request_hosted_feed_text(
+        url,
+        headers={"Accept": "application/json"},
+    )
     return load_feed_from_text(response.text, default_source="live_feed")
 
 

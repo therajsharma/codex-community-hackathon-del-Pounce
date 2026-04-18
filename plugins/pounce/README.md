@@ -34,7 +34,7 @@ Show the Pounce dashboard for this workspace
 
 Presentation docs:
 
-- [`docs/tripwire-final-spec.md`](../../docs/tripwire-final-spec.md)
+- [`docs/pounce-final-spec.md`](../../docs/pounce-final-spec.md)
 - [`docs/hackathon-demo.md`](../../docs/hackathon-demo.md)
 
 ## Local install
@@ -74,6 +74,11 @@ Feed selection in the dashboard is reported as one of:
 - `local_sync_cache`
 - `seed`
 
+The dashboard also reports:
+
+- `trust_state`: whether the active feed came from the bundled seed, local sync cache, hosted cache, or a live hosted fetch
+- `transport_policy`: the hosted-feed boundary, currently HTTPS-only with redirects disabled and a 5 MiB response cap
+
 ## Hook-enforced workflow
 
 The installed workspace hooks enforce a three-stage flow:
@@ -81,6 +86,8 @@ The installed workspace hooks enforce a three-stage flow:
 1. `UserPromptSubmit` snapshots dependency manifests and lockfiles for the current turn.
 2. `PreToolUse` inspects Bash dependency commands, blocks known-bad releases, and blocks non-exact specs until the command is rewritten to an exact version.
 3. `Stop` compares the current dependency files against the turn snapshot and blocks unexplained edits that were not recorded as expected mutations from a vetted install.
+
+When verification is degraded, `pounce.vet` stays available but returns `verification_status = "degraded"` and `manual_review_required = true`. Hook-enforced installs fail closed in that state.
 
 When Pounce can recommend a vetted exact rewrite, it returns a concrete command such as:
 

@@ -30,6 +30,7 @@ MAX_SCAN_FILE_COUNT = 1000
 MAX_NPM_GRAPH_NODES = 250
 POUNCE_HOOK_STATUS_MESSAGE = "Pounce vetting dependency command"
 GUARD_STATE_DIRNAME = "guard"
+WORKSPACE_RESERVED_DIRS = {".codex", ".pounce"}
 
 TEXT_FILE_NAMES = {
     "package.json",
@@ -328,6 +329,99 @@ def normalize_ecosystem(value: str | None) -> str:
     return normalized
 
 
+def runtime_plugin_root() -> Path:
+    return plugin_root_from_script(__file__)
+
+
+def make_validation_finding(*, artifact: str, detail: str, source: str = "input") -> dict[str, Any]:
+    return make_finding(
+        signal_id="invalid-input",
+        signal_name="invalid_input",
+        category="validation",
+        severity="medium",
+        verdict_impact="warn",
+        evidence=detail,
+        source=source,
+        artifact=artifact,
+        count_toward_block=False,
+    )
+
+
+def contains_whitespace_or_control(value: str) -> bool:
+    return any(character.isspace() or ord(character) < 32 for character in value)
+
+
+def validate_package_name(ecosystem: str, package_name: str) -> str | None:
+    name = package_name.strip()
+    if not name:
+        return "Package name is required."
+    if name.startswith("-"):
+        return f"Package name `{package_name}` cannot start with `-`."
+    if contains_whitespace_or_control(name):
+        return f"Package name `{package_name}` cannot contain whitespace or control characters."
+
+    lowered = name.lower()
+    if lowered.startswith(("file:", "git+", "http:", "https:")):
+        return f"Package name `{package_name}` must be a registry package name, not a URL or VCS reference."
+    if name.startswith(("/", "\\", ".", "~")):
+        return f"Package name `{package_name}` must not be a filesystem path."
+
+    if ecosystem == "npm":
+        if name.startswith("@"):
+            if name.count("/") != 1:
+                return f"Package name `{package_name}` must use the form `@scope/name`."
+            scope, scoped_name = name.split("/", 1)
+            if len(scope) <= 1 or not scoped_name:
+                return f"Package name `{package_name}` must use the form `@scope/name`."
+        elif "/" in name or "\\" in name:
+            return f"Package name `{package_name}` must not contain path separators."
+    elif ecosystem == "pypi":
+        if any(separator in name for separator in ("/", "\\", ":")):
+            return f"Package name `{package_name}` must not contain path separators or drive prefixes."
+
+    return None
+
+
+def is_within_path(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def validate_workspace_path_for_write(
+    workspace: Path,
+    *,
+    plugin_root: Path,
+    allowed_root: Path | None = None,
+) -> Path:
+    resolved = workspace.expanduser().resolve()
+    if not resolved.exists() or not resolved.is_dir():
+        raise ValueError(f"Workspace path does not exist or is not a directory: {resolved}")
+
+    home_dir = Path.home().resolve()
+    if resolved == Path("/"):
+        raise ValueError("Workspace path `/` is not allowed.")
+    if resolved == home_dir:
+        raise ValueError("Workspace path must not be the home directory.")
+    if resolved.name in WORKSPACE_RESERVED_DIRS:
+        raise ValueError(f"Workspace path must not point at `{resolved.name}`.")
+    if is_within_path(resolved, plugin_root):
+        raise ValueError("Workspace path must not point inside the Pounce plugin directory.")
+
+    state_dir = pounce_intel.state_dir().resolve()
+    if resolved == state_dir or is_within_path(resolved, state_dir):
+        raise ValueError("Workspace path must not point inside the shared Pounce state directory.")
+
+    if allowed_root is not None:
+        normalized_root = allowed_root.expanduser().resolve()
+        if not normalized_root.exists() or not normalized_root.is_dir():
+            raise ValueError(f"Allowed workspace root does not exist or is not a directory: {normalized_root}")
+        if not is_within_path(resolved, normalized_root):
+            raise ValueError(
+                f"Workspace path `{resolved}` must stay within the allowed workspace root `{normalized_root}`."
+            )
+
+    return resolved
+
+
 def load_seed_iocs(plugin_root: Path) -> list[dict[str, Any]]:
     context = pounce_intel.runtime_feed(plugin_root, None)
     feed = context.get("feed", {})
@@ -437,6 +531,16 @@ def build_feed_warning(detail: str, artifact: str, metadata: dict[str, Any] | No
         count_toward_block=False,
         metadata=metadata,
     )
+
+
+def verification_status_from_findings(findings: list[dict[str, Any]]) -> str:
+    if any(
+        isinstance(finding, dict)
+        and str(finding.get("signal_name", "")).strip() in {"verification_unavailable", "intel_feed_warning"}
+        for finding in findings
+    ):
+        return "degraded"
+    return "verified"
 
 
 def match_package_iocs(
@@ -891,13 +995,19 @@ def npm_package_spec(package_name: str, version: str) -> str:
 
 
 def load_npm_view_dependencies(package_name: str, version_spec: str) -> dict[str, str]:
+    validation_error = validate_package_name("npm", package_name)
+    if validation_error:
+        raise VerificationUnavailable(validation_error)
+    if version_spec.startswith("-"):
+        raise VerificationUnavailable(f"npm view spec for `{package_name}` must not start with `-`.")
+
     cache_key = npm_package_spec(package_name, version_spec)
     if cache_key in _NPM_VIEW_CACHE:
         return dict(_NPM_VIEW_CACHE[cache_key])
 
     try:
         completed = subprocess.run(
-            ["npm", "view", cache_key, "dependencies", "--json"],
+            ["npm", "view", "--", cache_key, "dependencies", "--json"],
             capture_output=True,
             text=True,
             check=False,
@@ -921,7 +1031,7 @@ def load_npm_view_dependencies(package_name: str, version_spec: str) -> dict[str
         except json.JSONDecodeError as exc:
             raise VerificationUnavailable(f"npm view returned invalid JSON for {cache_key}.") from exc
 
-    if payload in {None, ""}:
+    if payload is None or payload == "":
         dependencies = {}
     elif isinstance(payload, dict):
         dependencies = {str(name): str(spec) for name, spec in payload.items() if str(name).strip() and str(spec).strip()}
@@ -1128,6 +1238,9 @@ def check_release_age(published_at: datetime | None, artifact: str) -> list[dict
 
 
 def load_npm_package_index(package_name: str) -> dict[str, Any]:
+    validation_error = validate_package_name("npm", package_name)
+    if validation_error:
+        raise VerificationUnavailable(validation_error)
     return fetch_json(
         f"https://registry.npmjs.org/{quote(package_name, safe='@/')}",
         cache_key=f"npm:{package_name}",
@@ -1135,6 +1248,9 @@ def load_npm_package_index(package_name: str) -> dict[str, Any]:
 
 
 def load_pypi_package_index(package_name: str) -> dict[str, Any]:
+    validation_error = validate_package_name("pypi", package_name)
+    if validation_error:
+        raise VerificationUnavailable(validation_error)
     return fetch_json(
         f"https://pypi.org/pypi/{quote(package_name)}/json",
         cache_key=f"pypi-index:{normalize_python_package_key(package_name)}",
@@ -1247,13 +1363,6 @@ def check_pypi_release(package_name: str, version: str) -> list[dict[str, Any]]:
 def evaluate_verdict(findings: list[dict[str, Any]]) -> str:
     if any(finding["verdict_impact"] == "block" for finding in findings):
         return "block"
-    warn_count = sum(
-        1
-        for finding in findings
-        if finding["verdict_impact"] == "warn" and finding.get("count_toward_block", True)
-    )
-    if warn_count >= 2:
-        return "block"
     if any(finding["verdict_impact"] == "warn" for finding in findings):
         return "warn"
     return "allow"
@@ -1272,9 +1381,20 @@ def summarize_findings(verdict: str, findings: list[dict[str, Any]], artifact: s
     return f"{verdict.upper()}: {subject}: {highlights}"
 
 
-def build_stamp_path(workspace: Path, mode: str, slug_source: str) -> Path:
+def build_stamp_path(
+    workspace: Path,
+    mode: str,
+    slug_source: str,
+    *,
+    allowed_workspace_root: Path | None = None,
+) -> Path:
+    validated_workspace = validate_workspace_path_for_write(
+        workspace,
+        plugin_root=runtime_plugin_root(),
+        allowed_root=allowed_workspace_root,
+    )
     slug = slugify(slug_source)
-    return workspace / ".pounce" / "stamps" / f"{mode}-{slug}.json"
+    return validated_workspace / ".pounce" / "stamps" / f"{mode}-{slug}.json"
 
 
 def write_stamp(path: Path, payload: dict[str, Any]) -> str:
@@ -1292,8 +1412,18 @@ def safe_guard_turn_id(turn_id: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "-", turn_id).strip("-") or "active"
 
 
-def guard_state_path(workspace: Path, turn_id: str) -> Path:
-    return workspace / ".pounce" / GUARD_STATE_DIRNAME / f"turn-{safe_guard_turn_id(turn_id)}.json"
+def guard_state_path(
+    workspace: Path,
+    turn_id: str,
+    *,
+    allowed_workspace_root: Path | None = None,
+) -> Path:
+    validated_workspace = validate_workspace_path_for_write(
+        workspace,
+        plugin_root=runtime_plugin_root(),
+        allowed_root=allowed_workspace_root,
+    )
+    return validated_workspace / ".pounce" / GUARD_STATE_DIRNAME / f"turn-{safe_guard_turn_id(turn_id)}.json"
 
 
 def dependency_file_kind(path: Path) -> str | None:
@@ -1581,34 +1711,60 @@ def collect_dependency_snapshot(workspace: Path) -> dict[str, Any]:
     }
 
 
-def snapshot_dependency_guard(workspace: Path, turn_id: str) -> str:
-    state_path = guard_state_path(workspace, turn_id)
+def snapshot_dependency_guard(
+    workspace: Path,
+    turn_id: str,
+    *,
+    allowed_workspace_root: Path | None = None,
+) -> str:
+    validated_workspace = validate_workspace_path_for_write(
+        workspace,
+        plugin_root=runtime_plugin_root(),
+        allowed_root=allowed_workspace_root,
+    )
+    state_path = guard_state_path(validated_workspace, turn_id, allowed_workspace_root=validated_workspace)
     payload = {
         "turn_id": turn_id,
-        "workspace": str(workspace),
+        "workspace": str(validated_workspace),
         "captured_at": iso_now(),
-        "snapshot": collect_dependency_snapshot(workspace),
+        "snapshot": collect_dependency_snapshot(validated_workspace),
         "allowlist": [],
     }
     write_json(state_path, payload)
     return str(state_path)
 
 
-def load_guard_state(workspace: Path, turn_id: str) -> dict[str, Any]:
-    state_path = guard_state_path(workspace, turn_id)
+def load_guard_state(
+    workspace: Path,
+    turn_id: str,
+    *,
+    allowed_workspace_root: Path | None = None,
+) -> dict[str, Any]:
+    state_path = guard_state_path(workspace, turn_id, allowed_workspace_root=allowed_workspace_root)
     payload = load_json_file(state_path, default={})
     return payload if isinstance(payload, dict) else {}
 
 
-def record_dependency_guard_allowlist(workspace: Path, turn_id: str, expected_mutations: list[dict[str, Any]]) -> str:
-    state_path = guard_state_path(workspace, turn_id)
-    payload = load_guard_state(workspace, turn_id)
+def record_dependency_guard_allowlist(
+    workspace: Path,
+    turn_id: str,
+    expected_mutations: list[dict[str, Any]],
+    *,
+    allowed_workspace_root: Path | None = None,
+) -> str:
+    validated_workspace = validate_workspace_path_for_write(
+        workspace,
+        plugin_root=runtime_plugin_root(),
+        allowed_root=allowed_workspace_root,
+    )
+    state_path = guard_state_path(validated_workspace, turn_id, allowed_workspace_root=validated_workspace)
+    payload = load_guard_state(validated_workspace, turn_id, allowed_workspace_root=validated_workspace)
     if not payload:
         payload = {
             "turn_id": turn_id,
-            "workspace": str(workspace),
+            "workspace": str(validated_workspace),
             "captured_at": iso_now(),
-            "snapshot": collect_dependency_snapshot(workspace),
+            "snapshot": collect_dependency_snapshot(validated_workspace),
             "allowlist": [],
         }
 
@@ -1718,16 +1874,36 @@ def summarize_dependency_guard_diff(
     return "; ".join(lines)
 
 
-def assess_dependency_guard(workspace: Path, turn_id: str) -> dict[str, Any]:
-    payload = load_guard_state(workspace, turn_id)
+def assess_dependency_guard(
+    workspace: Path,
+    turn_id: str,
+    *,
+    allowed_workspace_root: Path | None = None,
+) -> dict[str, Any]:
+    validated_workspace = validate_workspace_path_for_write(
+        workspace,
+        plugin_root=runtime_plugin_root(),
+        allowed_root=allowed_workspace_root,
+    )
+    payload = load_guard_state(validated_workspace, turn_id, allowed_workspace_root=validated_workspace)
     if not payload:
-        return {"block": False, "message": None, "diff": {"manifest_changes": [], "lockfile_changes": []}}
+        return {
+            "block": True,
+            "message": "Pounce could not verify dependency guard state for this turn. Manual review is required.",
+            "diff": {"manifest_changes": [], "lockfile_changes": []},
+            "reason_code": "guard_state_missing",
+        }
 
     before_snapshot = payload.get("snapshot")
     if not isinstance(before_snapshot, dict):
-        return {"block": False, "message": None, "diff": {"manifest_changes": [], "lockfile_changes": []}}
+        return {
+            "block": True,
+            "message": "Pounce found a corrupt dependency guard snapshot for this turn. Manual review is required.",
+            "diff": {"manifest_changes": [], "lockfile_changes": []},
+            "reason_code": "guard_state_invalid",
+        }
 
-    after_snapshot = collect_dependency_snapshot(workspace)
+    after_snapshot = collect_dependency_snapshot(validated_workspace)
     diff = diff_dependency_snapshots(before_snapshot, after_snapshot)
     allowlist = payload.get("allowlist")
     if not isinstance(allowlist, list):
@@ -2018,14 +2194,20 @@ def scan_workspace(workspace: Path, indicators: list[dict[str, Any]]) -> list[di
     return deduped
 
 
-def vet_payload(payload: dict[str, Any], plugin_root: Path, *, write_stamp_enabled: bool = True) -> dict[str, Any]:
+def vet_payload(
+    payload: dict[str, Any],
+    plugin_root: Path,
+    *,
+    write_stamp_enabled: bool = True,
+    allowed_workspace_root: Path | None = None,
+) -> dict[str, Any]:
     mode = str(payload.get("mode", "release")).strip().lower()
     ecosystem = normalize_ecosystem(payload.get("ecosystem"))
     package_name = str(payload.get("package_name", "")).strip()
     version = str(payload.get("version", "")).strip()
     reason = str(payload.get("reason", "")).strip()
     workspace_value = str(payload.get("workspace", "")).strip()
-    workspace = Path(workspace_value).expanduser().resolve() if workspace_value else None
+    workspace: Path | None = None
     artifacts = normalize_artifacts(payload.get("artifacts"))
     ioc_query = payload.get("ioc_query")
     if isinstance(ioc_query, str) and ioc_query:
@@ -2048,6 +2230,18 @@ def vet_payload(payload: dict[str, Any], plugin_root: Path, *, write_stamp_enabl
     baseline_version: str | None = None
     baseline_source: str | None = None
     next_action: str | None = None
+    artifact: str | None = None
+
+    if workspace_value:
+        try:
+            workspace = validate_workspace_path_for_write(
+                Path(workspace_value),
+                plugin_root=plugin_root,
+                allowed_root=allowed_workspace_root,
+            )
+        except ValueError as exc:
+            findings.append(make_validation_finding(artifact=workspace_value, detail=str(exc)))
+            workspace = None
 
     if mode not in {"release", "sweep"}:
         findings.append(
@@ -2066,53 +2260,56 @@ def vet_payload(payload: dict[str, Any], plugin_root: Path, *, write_stamp_enabl
 
     if mode == "release":
         if package_name and version and ecosystem in {"npm", "pypi"}:
+            validation_error = validate_package_name(ecosystem, package_name)
             artifact = f"{package_name}@{version}" if ecosystem == "npm" else f"{package_name}=={version}"
-            findings.extend(
-                match_package_iocs(
-                    indicators,
-                    ecosystem=ecosystem,
-                    package_name=package_name,
-                    version=version,
-                )
-            )
-            try:
-                osv_items = pounce_intel.on_demand_osv_items(ecosystem, package_name, version)
-            except pounce_intel.IntelUnavailable as exc:
-                findings.append(build_verification_unavailable(source="osv", artifact=artifact, detail=str(exc)))
+            if validation_error:
+                findings.append(make_validation_finding(artifact=artifact, detail=validation_error))
             else:
                 findings.extend(
                     match_package_iocs(
-                        osv_items,
+                        indicators,
                         ecosystem=ecosystem,
                         package_name=package_name,
                         version=version,
                     )
                 )
-            if ecosystem == "npm":
-                findings.extend(check_npm_release(package_name, version, workspace))
                 try:
-                    package_index = load_npm_package_index(package_name)
-                except VerificationUnavailable:
-                    package_index = None
-                if isinstance(package_index, dict):
-                    baseline_version, baseline_source = resolve_npm_release_baseline(
-                        package_index, package_name, version, workspace
+                    osv_items = pounce_intel.on_demand_osv_items(ecosystem, package_name, version)
+                except pounce_intel.IntelUnavailable as exc:
+                    findings.append(build_verification_unavailable(source="osv", artifact=artifact, detail=str(exc)))
+                else:
+                    findings.extend(
+                        match_package_iocs(
+                            osv_items,
+                            ecosystem=ecosystem,
+                            package_name=package_name,
+                            version=version,
+                        )
                     )
-            elif ecosystem == "pypi":
-                findings.extend(check_pypi_release(package_name, version))
-                try:
-                    package_index = load_pypi_package_index(package_name)
-                except VerificationUnavailable:
-                    package_index = None
-                if isinstance(package_index, dict):
-                    baseline_version, baseline_source = resolve_pypi_release_baseline(
-                        package_index, package_name, version, workspace
-                    )
+                if ecosystem == "npm":
+                    findings.extend(check_npm_release(package_name, version, workspace))
+                    try:
+                        package_index = load_npm_package_index(package_name)
+                    except VerificationUnavailable:
+                        package_index = None
+                    if isinstance(package_index, dict):
+                        baseline_version, baseline_source = resolve_npm_release_baseline(
+                            package_index, package_name, version, workspace
+                        )
+                elif ecosystem == "pypi":
+                    findings.extend(check_pypi_release(package_name, version))
+                    try:
+                        package_index = load_pypi_package_index(package_name)
+                    except VerificationUnavailable:
+                        package_index = None
+                    if isinstance(package_index, dict):
+                        baseline_version, baseline_source = resolve_pypi_release_baseline(
+                            package_index, package_name, version, workspace
+                        )
         elif package_name or version:
             findings.append(
-                build_verification_unavailable(
-                    source="input",
-                    artifact=f"{package_name} {version}".strip(),
+                make_validation_finding(
+                    artifact=f"{package_name} {version}".strip() or "release",
                     detail="Release vetting requires ecosystem, package_name, and version.",
                 )
             )
@@ -2122,13 +2319,12 @@ def vet_payload(payload: dict[str, Any], plugin_root: Path, *, write_stamp_enabl
             package_name or version or None
         )
     else:
-        artifact = str(workspace) if workspace else "workspace"
+        artifact = workspace_value or "workspace"
         if not workspace:
             findings.append(
-                build_verification_unavailable(
-                    source="input",
-                    artifact="workspace",
-                    detail="Sweep mode requires a workspace path.",
+                make_validation_finding(
+                    artifact=artifact,
+                    detail="Sweep mode requires a valid workspace path.",
                 )
             )
         else:
@@ -2163,7 +2359,12 @@ def vet_payload(payload: dict[str, Any], plugin_root: Path, *, write_stamp_enabl
         deduped_findings.append(finding)
     findings = deduped_findings
 
+    verification_status = verification_status_from_findings(findings)
     verdict = evaluate_verdict(findings)
+    manual_review_required = verification_status == "degraded" and verdict != "block"
+    if manual_review_required and not next_action:
+        next_action = "manual_review"
+
     checked_at = iso_now()
     summary = summarize_findings(verdict, findings, artifact, mode)
     stamp_path = None
@@ -2181,9 +2382,14 @@ def vet_payload(payload: dict[str, Any], plugin_root: Path, *, write_stamp_enabl
             "baseline_source": baseline_source,
             "next_action": next_action,
             "intel_selected_from": intel_selected_from,
+            "verification_status": verification_status,
+            "manual_review_required": manual_review_required,
         }
         slug_source = artifact or workspace.name
-        stamp_path = write_stamp(build_stamp_path(workspace, mode, slug_source), stamp_payload)
+        stamp_path = write_stamp(
+            build_stamp_path(workspace, mode, slug_source, allowed_workspace_root=allowed_workspace_root or workspace),
+            stamp_payload,
+        )
 
     return {
         "verdict": verdict,
@@ -2197,6 +2403,8 @@ def vet_payload(payload: dict[str, Any], plugin_root: Path, *, write_stamp_enabl
         "baseline_source": baseline_source,
         "next_action": next_action,
         "intel_selected_from": intel_selected_from,
+        "verification_status": verification_status,
+        "manual_review_required": manual_review_required,
     }
 
 
@@ -2572,6 +2780,7 @@ def evaluate_recommendation_candidate(
         },
         plugin_root,
         write_stamp_enabled=False,
+        allowed_workspace_root=workspace,
     )
 
 
@@ -2622,7 +2831,7 @@ def recommend_vetted_version(dependency: DependencyCommand, plugin_root: Path, w
 
     for candidate_version in candidate_versions:
         result = evaluate_recommendation_candidate(dependency, candidate_version, plugin_root, workspace)
-        if result["verdict"] == "allow":
+        if result["verdict"] == "allow" and not result.get("manual_review_required"):
             recommended_version = candidate_version
             break
 
@@ -2716,10 +2925,16 @@ def assess_dependency_command(command: str, plugin_root: Path, workspace: Path) 
                 "artifacts": [command],
             },
             plugin_root,
+            allowed_workspace_root=workspace,
         )
         results.append(result)
         if result["verdict"] == "block":
             blocks.append(result["summary"])
+            continue
+        if result.get("manual_review_required"):
+            blocks.append(
+                f"Pounce could not fully verify `{dependency.artifact}`. Manual review is required before installs continue."
+            )
             continue
         if result["verdict"] == "warn":
             warnings.append(result["summary"])
@@ -2903,10 +3118,6 @@ def isoformat_utc(value: datetime | None) -> str | None:
     if value is None:
         return None
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
-
-
-def is_within_path(path: Path, root: Path) -> bool:
-    return path == root or root in path.parents
 
 
 def workspace_has_dashboard_signals(workspace: Path) -> bool:
@@ -3105,6 +3316,7 @@ def build_workspace_dashboard(workspace: Path | None, *, available: bool) -> dic
             "available": False,
             "path": None,
             "protection_status": "unavailable",
+            "degraded_reason": "No workspace was resolved for dashboard inspection.",
             "managed_policy": False,
             "hooks_configured": {
                 "pre_tool_use_bash": False,
@@ -3129,18 +3341,27 @@ def build_workspace_dashboard(workspace: Path | None, *, available: bool) -> dic
     latest_guard_snapshot = next(iter(dashboard_guard_entries(workspace)), None) if available else None
     stamp_entries = dashboard_stamp_entries(workspace) if available else []
     last_sweep = next((entry for entry in stamp_entries if entry["mode"] == "sweep"), None)
+    degraded_reasons: list[str] = []
 
     if not available:
         protection_status = "unavailable"
+        degraded_reasons.append("Workspace path was unavailable.")
     elif managed_policy and hook_status["all_events"] and hooks_enabled:
         protection_status = "protected"
     else:
         protection_status = "partial"
+        if not managed_policy:
+            degraded_reasons.append("Managed policy is missing.")
+        if not hook_status["all_events"]:
+            degraded_reasons.append("Workspace hook configuration is incomplete.")
+        if not hooks_enabled:
+            degraded_reasons.append("Codex hooks are disabled.")
 
     return {
         "available": available,
         "path": str(workspace),
         "protection_status": protection_status,
+        "degraded_reason": " ".join(degraded_reasons) if degraded_reasons else None,
         "managed_policy": managed_policy,
         "hooks_configured": hook_status,
         "hooks_enabled": hooks_enabled,
@@ -3162,8 +3383,17 @@ def build_feed_dashboard(plugin_root: Path) -> dict[str, Any]:
     if not isinstance(warnings, list):
         warnings = []
 
+    selected_from = str(context.get("selected_from", "")).strip() or "seed"
+    trust_state_map = {
+        "remote": "hosted_feed_unverified",
+        "remote_cache": "hosted_feed_cache_unverified",
+        "local_sync_cache": "local_sync_cache",
+        "seed": "bundled_seed",
+    }
     return {
-        "selected_from": str(context.get("selected_from", "")).strip() or "seed",
+        "selected_from": selected_from,
+        "trust_state": trust_state_map.get(selected_from, "unknown"),
+        "transport_policy": "https-only hosted feeds, redirects disabled, 5 MiB response cap",
         "cache_timestamp": str(context.get("cache_timestamp", "")).strip() or None,
         "active_item_count": len(pounce_intel.active_feed_items(items)),
         "warnings": [
@@ -3247,6 +3477,10 @@ def render_dashboard_markdown(snapshot: dict[str, Any]) -> str:
             f"{'enabled' if workspace.get('hooks_enabled') else 'disabled'} in `.codex/config.toml`"
         )
         lines.append(f"- Dependency files tracked: {workspace.get('dependency_file_count', 0)}")
+        degraded_reason_value = workspace.get("degraded_reason")
+        degraded_reason = degraded_reason_value.strip() if isinstance(degraded_reason_value, str) else ""
+        if degraded_reason:
+            lines.append(f"- Degraded reason: {degraded_reason}")
 
         latest_guard = workspace.get("latest_guard_snapshot")
         if isinstance(latest_guard, dict):
@@ -3272,9 +3506,14 @@ def render_dashboard_markdown(snapshot: dict[str, Any]) -> str:
     lines.append("")
     lines.append("### Feed")
     selected_from = str(feed.get("selected_from", "seed")).strip() or "seed"
+    trust_state = str(feed.get("trust_state", "unknown")).strip() or "unknown"
+    transport_policy = str(feed.get("transport_policy", "")).strip()
     raw_cache_timestamp = feed.get("cache_timestamp")
     cache_timestamp = str(raw_cache_timestamp).strip() if raw_cache_timestamp is not None else ""
     lines.append(f"- Selected source: `{selected_from}`")
+    lines.append(f"- Trust state: `{trust_state}`")
+    if transport_policy:
+        lines.append(f"- Transport policy: {transport_policy}")
     if cache_timestamp:
         lines.append(f"- Freshness timestamp: `{cache_timestamp}`")
     else:

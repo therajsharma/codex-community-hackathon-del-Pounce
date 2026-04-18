@@ -16,6 +16,7 @@ from pounce_runtime import (
     plugin_root_from_script,
     render_workspace_hooks,
     replace_managed_block,
+    validate_workspace_path_for_write,
     write_json,
 )
 
@@ -103,6 +104,7 @@ def update_marketplace(path: Path) -> None:
 
 
 def update_agents_md(workspace: Path) -> None:
+    validate_workspace_path_for_write(workspace, plugin_root=plugin_root_from_script(__file__), allowed_root=workspace)
     agents_path = workspace / "AGENTS.md"
     existing = agents_path.read_text(encoding="utf-8") if agents_path.exists() else ""
     updated = replace_managed_block(existing, agents_block_text())
@@ -110,6 +112,7 @@ def update_agents_md(workspace: Path) -> None:
 
 
 def write_workspace_hooks(workspace: Path, installed_root: Path) -> None:
+    validate_workspace_path_for_write(workspace, plugin_root=plugin_root_from_script(__file__), allowed_root=workspace)
     codex_dir = workspace / ".codex"
     codex_dir.mkdir(parents=True, exist_ok=True)
     hooks_path = codex_dir / "hooks.json"
@@ -123,7 +126,11 @@ def write_workspace_hooks(workspace: Path, installed_root: Path) -> None:
 def main() -> int:
     args = parse_args()
     source_root = plugin_root_from_script(__file__)
-    workspace = Path(args.workspace).expanduser().resolve()
+    workspace = validate_workspace_path_for_write(
+        Path(args.workspace),
+        plugin_root=source_root,
+        allowed_root=Path(args.workspace).expanduser().resolve(),
+    )
     installed_root = Path.home() / ".codex" / "plugins" / PLUGIN_NAME
     marketplace_path = Path.home() / ".agents" / "plugins" / "marketplace.json"
 

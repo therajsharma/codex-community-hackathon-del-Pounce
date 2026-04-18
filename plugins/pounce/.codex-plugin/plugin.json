@@ -41,6 +41,8 @@
     "brandColor": "#C2410C",
     "composerIcon": "./assets/pounce-icon.svg",
     "logo": "./assets/pounce-logo.svg",
-    "screenshots": []
+    "screenshots": [
+      "./assets/pounce-dashboard.png"
+    ]
   }
 }
