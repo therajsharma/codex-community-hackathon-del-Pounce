@@ -8,6 +8,10 @@ Pounce is a Codex-native dependency security layer that vets exact package relea
 
 ![Pounce plugin overview](docs/git_main_plugin.png)
 
+## Video Demo
+
+[Watch the demo on Google Drive](https://drive.google.com/drive/u/2/folders/1a3hXxOiXWcVuOT-jnO5UUN-eWs7X2YBB)
+
 ## Quick start
 
 ```bash
