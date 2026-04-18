@@ -16,3 +16,4 @@ dist/
 venv/
 .idea/
 .vscode/
+docs/pounce-final-spec.md
